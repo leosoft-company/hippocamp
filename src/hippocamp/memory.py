@@ -28,7 +28,7 @@ from hippocamp.meta import (
     load_or_init_meta,
     write_meta,
 )
-from hippocamp.ranker import rank
+from hippocamp.ranker import rank, tokenize
 from hippocamp.store import Store
 from hippocamp.types import CompactReport, Inventory, RecallResult
 
@@ -293,13 +293,16 @@ class Memory:
             return []
 
         query_emb = self._embedder(query)
+        query_tokens = tokenize(query)
         rows = self._store.search(
             query_emb=query_emb,
             kinds=list(kinds) if kinds else None,
             candidate_limit=max(limit * 4, 40),
+            query_tokens=query_tokens,
         )
 
-        ranked = rank(rows, query_emb=query_emb, context=context, now=_now())
+        ranked = rank(rows, query_emb=query_emb, context=context, now=_now(),
+                      query_tokens=query_tokens)
         results = ranked[:limit]
         self._store.bump_salience([r.id for r in results])
         return results

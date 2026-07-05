@@ -1,4 +1,9 @@
-"""Four-signal ranker: similarity + recency + kind-boost + salience.
+"""Five-signal ranker: similarity + recency + kind-boost + salience + lexical.
+
+The lexical term exists because small embedders are anisotropic: generic
+memories score ~0.6 cosine against *any* query and act as attractors,
+while a memory literally containing the query's rare token ("SPC") can
+rank below them. Distinctive-token overlap cuts through that.
 
 Each ranked result carries a `Why` trace that explains how its score was
 composed. Surfacing the *why* is one of Hippocamp's wedges over single-
@@ -17,6 +22,25 @@ W_SIM = 1.0
 W_REC = 0.3
 W_KIND = 0.2
 W_SAL = 0.4
+W_LEX = 0.5
+
+# Tokens too common to signal anything — kept deliberately small.
+STOPWORDS = frozenset(
+    "the and for with that this from have has had are was were what when "
+    "where which who how you your our their they them its can could should "
+    "would will been being about into over under not but all any some out "
+    "get got does did just like more most very much".split()
+)
+
+
+def tokenize(text: str) -> set[str]:
+    """Distinctive lowercase tokens (len ≥ 3, non-stopword) for lexical
+    matching — shared by recall's retrieval and the ranker."""
+    import re
+    return {
+        t for t in re.findall(r"[a-z0-9]+", text.lower())
+        if len(t) >= 3 and t not in STOPWORDS
+    }
 
 KIND_BOOSTS: dict[str, float] = {
     "preference": 1.2,
@@ -34,21 +58,29 @@ def rank(
     query_emb: list[float],
     context: dict[str, Any] | None,
     now: datetime,
+    query_tokens: set[str] | None = None,
 ) -> list[RecallResult]:
     results: list[RecallResult] = []
+    tokens = query_tokens or set()
     for row in rows:
         sim = _cosine(query_emb, row.embedding)
         rec = _recency_decay(row.created_at, now)
         kb = KIND_BOOSTS.get(row.kind, 1.0)
         sal = _salience_factor(row.salience)
+        lex = 0.0
+        if tokens:
+            text_tokens = tokenize(row.text)
+            lex = len(tokens & text_tokens) / len(tokens)
 
-        total = W_SIM * sim + W_REC * rec + W_KIND * (kb - 1.0) + W_SAL * sal
+        total = (W_SIM * sim + W_REC * rec + W_KIND * (kb - 1.0)
+                 + W_SAL * sal + W_LEX * lex)
 
         why = Why(
             similarity=sim,
             recency=rec,
             kind_boost=kb,
             salience=sal,
+            lexical=lex,
             total=total,
             note=_compose_note(sim, rec, kb, sal),
         )

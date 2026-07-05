@@ -304,6 +304,7 @@ class Store:
         query_emb: list[float],
         kinds: list[str] | None,
         candidate_limit: int,
+        query_tokens: set[str] | None = None,
     ) -> list[RawRow]:
         """Return candidate rows for the ranker.
 
@@ -318,8 +319,43 @@ class Store:
         if self._vec_enabled and self._embedding_dim is not None and len(
             query_emb
         ) == self._embedding_dim:
-            return self._search_vec(query_emb, kinds, candidate_limit)
+            rows = self._search_vec(query_emb, kinds, candidate_limit)
+            # Hybrid retrieval: a row containing the query's distinctive
+            # tokens must reach the ranker even when the embedder puts it
+            # outside the KNN neighbourhood (small embedders rank generic
+            # attractor memories above literal topic matches).
+            if query_tokens:
+                seen = {row.id for row in rows}
+                rows += [
+                    row for row in self._search_lexical(query_tokens, kinds)
+                    if row.id not in seen
+                ]
+            return rows
         return self._search_naive(kinds)
+
+    def _search_lexical(
+        self, tokens: set[str], kinds: list[str] | None, limit: int = 200
+    ) -> list[RawRow]:
+        if not tokens:
+            return []
+        sql = (
+            "SELECT id, kind, text, created_at, last_seen_at, salience, "
+            "metadata, embedding FROM memories WHERE superseded_at IS NULL"
+        )
+        params: list[Any] = []
+        likes = []
+        for token in sorted(tokens)[:8]:  # cap the OR fan-out
+            likes.append("lower(text) LIKE ?")
+            params.append(f"%{token}%")
+        sql += " AND (" + " OR ".join(likes) + ")"
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            sql += f" AND kind IN ({placeholders})"
+            params.extend(kinds)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_from_tuple(r) for r in rows]
 
     def _search_vec(
         self,

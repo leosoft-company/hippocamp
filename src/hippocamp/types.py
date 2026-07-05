@@ -17,6 +17,7 @@ class Why(BaseModel):
     recency: float
     kind_boost: float
     salience: float
+    lexical: float = 0.0
     total: float
     note: str = ""
 
