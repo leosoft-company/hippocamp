@@ -1,0 +1,27 @@
+{
+  "_comment": "Minimums the recall benchmark must meet. Raise them when quality improves; never lower them to make a change pass.",
+  "large": {
+    "ALL.hit@3": 0.9,
+    "ALL.hit@1": 0.75,
+    "paraphrase.hit@3": 0.85,
+    "preference.hit@3": 0.85,
+    "rare_token.hit@3": 1.0,
+    "episodic.hit@3": 0.9,
+    "entity.hit@3": 1.0,
+    "direct.hit@3": 1.0
+  },
+  "small": {
+    "ALL.hit@3": 0.95,
+    "ALL.hit@1": 0.8
+  },
+  "holdout_large": {
+    "ALL.hit@3": 0.85
+  },
+  "answerable_marked_strong": 0.9,
+  "kind_filter_full_lists": 1.0,
+  "repeat_identical": 1.0,
+  "_open": {
+    "unanswerable_marked_weak": 0.7,
+    "_why": "Reported, not gating. Similarity scores cannot separate 'same topic' from 'answers it' (best balanced accuracy 0.63-0.79 across every score feature tried, both embedders; see evals/tune.py). Needs a reranker or a model judging relevance. Until then `match` is a lenient floor."
+  }
+}
