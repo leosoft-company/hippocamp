@@ -44,6 +44,11 @@ DEFAULT_STRONG_SIMILARITY = 0.5
 # better one competes for the top places (the other moves to the tail).
 NEAR_DUPLICATE_EPISODE = 0.90
 
+# With a reranker configured: its score (0–1) is added with this weight, and
+# only the best RERANK_TOP candidates are re-scored.
+W_RERANK = 0.4
+RERANK_TOP = 20
+
 # Tokens too common to signal anything — kept deliberately small.
 STOPWORDS = frozenset(
     "the and for with that this from have has had are was were what when "

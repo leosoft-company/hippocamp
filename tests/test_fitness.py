@@ -318,6 +318,48 @@ def test_cli_can_expire_forget_and_compact(tmp_path, monkeypatch, capsys):
     assert on_disk(tmp_path, "FORGETME") == [] and on_disk(tmp_path, "OLDEP") == []
 
 
+def test_cli_reflect_all_covers_every_store_in_the_map(tmp_path, monkeypatch, capsys):
+    """The nightly job must consolidate each person's store, not just the default."""
+    import hippocamp.cli as cli
+    stores = {}
+    for name in ("dana", "riley", "home"):
+        m, d = mk(tmp_path, sub=name)
+        for i in range(6): m.observe(f"{name} episode {i}")
+        m.close(); stores[name] = str(d)
+    m, d = mk(tmp_path, sub="quiet"); m.close(); stores["quiet"] = str(d)      # nothing to do
+    monkeypatch.setenv("HIPPOCAMP_STORES", json.dumps(stores))
+    llms = []
+    monkeypatch.setattr(cli, "_resolve_llm", lambda name: llms.append(echo_llm()) or llms[-1])
+    assert _cli(monkeypatch, tmp_path, "reflect", "--all") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {k: v["episodes_processed"] for k, v in out.items()} == {"dana": 6, "riley": 6, "home": 6, "quiet": 0}
+    for name in ("dana", "riley", "home"):
+        m, _ = mk(tmp_path, sub=name)
+        texts = [r[0] for r in m._store._conn.execute("SELECT text FROM memories WHERE kind='episode'")]
+        assert m.inspect().facts == 6 and all(t.startswith(name) for t in texts)
+    # each store got its own model conversation: no episode text crossed over
+    for llm in llms:
+        owners = {re.search(r"\] \S+ (\w+) episode", line).group(1) for p in llm.prompts for line in p.splitlines() if " episode " in line}
+        assert len(owners) <= 1
+
+
+def test_cli_reflect_all_reports_a_failing_store_and_continues(tmp_path, monkeypatch, capsys):
+    import hippocamp.cli as cli
+    stores = {}
+    for name in ("dana", "riley"):
+        m, d = mk(tmp_path, sub=name)
+        for i in range(6): m.observe(f"{name} episode {i}")
+        m.close(); stores[name] = str(d)
+    monkeypatch.setenv("HIPPOCAMP_STORES", json.dumps(stores))
+    def llm_for(name):
+        return FakeLLM(lambda p: "not json" if "dana episode" in p else json.dumps(
+            {"facts": [{"text": f"from {e}", "evidence": [e]} for e in ep_ids(p)]}))
+    monkeypatch.setattr(cli, "_resolve_llm", llm_for)
+    assert _cli(monkeypatch, tmp_path, "reflect", "--all") == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "error" in out["dana"] and out["riley"]["episodes_processed"] == 6
+
+
 # ============================================================= replay / sync
 
 def rebuild(tmp_path, m, **kw):
@@ -582,3 +624,60 @@ def test_cached_model_loads_without_the_network(monkeypatch):
     from hippocamp.embedders import Qwen3Embedder
     Qwen3Embedder()
     assert calls[0].get("local_files_only") is True and len(calls) == 1
+
+
+def test_local_server_embedder_is_loopback_only():
+    from hippocamp.embedders import LocalServerEmbedder, embeddinggemma
+    with pytest.raises(RuntimeError, match="loopback"):
+        LocalServerEmbedder("m", name="m", dim=4, base_url="http://example.com:1234")
+    e = embeddinggemma(base_url="http://127.0.0.1:9")
+    assert (e.name, e.dim) == ("embeddinggemma-300m", 768)
+    with pytest.raises(RuntimeError, match="did not answer"):
+        e("anything")
+
+
+# ================================================================== reranker
+
+class FakeReranker:
+    """Says a memory answers the question only if it contains the word 'answer'."""
+    strong_score = 0.5
+    def __init__(self): self.calls = []
+    def __call__(self, query, texts):
+        self.calls.append((query, list(texts)))
+        return [0.9 if "answer" in t else 0.01 for t in texts]
+
+
+def test_a_reranker_reorders_and_labels_results(tmp_path):
+    rr = FakeReranker()
+    d = tmp_path / "store"
+    m = Memory(str(d), embedder=HashEmbedder(), device_id="dev-a", cache_dir=str(tmp_path / "cache"), reranker=rr)
+    for i in range(12): m.assert_fact(f"unrelated fact {i}")
+    right = m.assert_fact("this one is the answer")
+    hits = m.recall("anything at all", limit=5)
+    assert hits[0].id == right and hits[0].match == "strong" and hits[0].why.rerank == 0.9
+    assert all(h.match == "weak" for h in hits[1:])
+    assert len(rr.calls) == 1 and len(rr.calls[0][1]) == 13     # one batch, all candidates up to the cap
+    again = m.recall("anything at all", limit=5)
+    assert [h.id for h in again] == [h.id for h in hits]
+
+
+def test_with_a_reranker_nothing_relevant_means_all_weak(tmp_path):
+    rr = FakeReranker()
+    m = Memory(str(tmp_path / "s"), embedder=HashEmbedder(), device_id="dev-a", cache_dir=str(tmp_path / "c"), reranker=rr)
+    for i in range(5): m.assert_fact(f"unrelated fact {i}")
+    out = build_tools(m)["recall_memory"](query="what is my blood type")
+    assert all(r["match"] == "weak" for r in out["results"]) and "note" in out
+
+
+def test_without_a_reranker_nothing_changes(tmp_path):
+    m, _ = mk(tmp_path); m.assert_fact("boat is called Petrel")
+    assert m.recall("boat")[0].why.rerank is None
+
+
+def test_reranker_is_opt_in_by_environment(monkeypatch):
+    from hippocamp import rerank
+    monkeypatch.delenv("HIPPOCAMP_RERANKER", raising=False)
+    assert rerank.from_env() is None
+    monkeypatch.setenv("HIPPOCAMP_RERANKER", "nonsense")
+    with pytest.raises(ValueError):
+        rerank.from_env()

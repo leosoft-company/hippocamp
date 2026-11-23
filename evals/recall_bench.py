@@ -8,7 +8,7 @@ Every question has a known right answer. The same questions are asked of a
 Exit code is 1 if any threshold in thresholds.json is missed.
 """
 from __future__ import annotations
-import json, statistics, sys, time
+import json, os, statistics, sys, time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -121,8 +121,11 @@ def check(results, thr):
         for key, want in thr.get(size, {}).items():
             cat, metric = key.split(".")
             need(f"{size} {key}", results[size]["all"]["table"][cat][metric], want)
-        for k in ("answerable_marked_strong", "kind_filter_full_lists", "repeat_identical"):
-            need(f"{size} {k}", results[size][k], thr[k])
+        rr = thr["with_reranker"] if os.environ.get("EVAL_RERANKER") == "1" else {}
+        gates = {k: thr[k] for k in ("answerable_marked_strong", "kind_filter_full_lists", "repeat_identical")}
+        gates.update({k: v for k, v in rr.items() if not k.startswith("_")})
+        for k, want in gates.items():
+            need(f"{size} {k}", results[size][k], want)
     if "large" in results:
         for key, want in thr.get("holdout_large", {}).items():
             cat, metric = key.split(".")

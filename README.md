@@ -125,11 +125,12 @@ Run it on demand, or on a cron:
 ```bash
 hippocamp reflect                     # local model; everything not yet read
 hippocamp reflect --since 2026-05-01  # re-read from a date (repeats are not stored twice)
+hippocamp reflect --all               # every store in $HIPPOCAMP_STORES (for a nightly job)
 ```
 
 Reflection reads your private memory, so by default it runs on a **local model** and nothing leaves the machine:
 
-1. **Local (default)** — any OpenAI-compatible server on this machine (LM Studio, llama.cpp server, Ollama's `/v1`, `mlx_lm.server`). Defaults to `http://127.0.0.1:1234` and the first chat model it lists; override with `HIPPOCAMP_LLM_URL` and `HIPPOCAMP_LLM_MODEL`. A non-loopback URL is refused.
+1. **Local (default)** — any OpenAI-compatible server on this machine (LM Studio, llama.cpp server, Ollama's `/v1`, `mlx_lm.server`). Defaults to `http://127.0.0.1:1234` and the first chat model it lists; override with `HIPPOCAMP_LLM_URL` and `HIPPOCAMP_LLM_MODEL`. A non-loopback URL is refused. The reply is requested as schema-constrained JSON with thinking off, which takes a thinking model from minutes to seconds per batch (`HIPPOCAMP_LLM_STRUCTURED=0` and `HIPPOCAMP_LLM_REASONING=default` turn those off).
 2. **Bring your own** — pass any object with a `complete(prompt, *, system) -> str` method via `Memory(llm=...)`.
 3. **Cloud, only on purpose** — `hippocamp reflect --llm anthropic` (needs `pip install 'hippocamp[llm]'` and `ANTHROPIC_API_KEY`) or `--llm claude-cli`. Both send episode text to Anthropic and refuse to run unless `HIPPOCAMP_ALLOW_CLOUD_REFLECT=1` is set. Neither is ever chosen automatically.
 
@@ -252,7 +253,13 @@ hippocamp setup claude --project-instructions ~/projects/myapp
 
 `pytest` runs the behaviour tests (`tests/test_fitness.py` pins every fix in [docs/fitness-plan.md](docs/fitness-plan.md)). `python evals/recall_bench.py` measures recall on a made-up household against the minimums in `evals/thresholds.json`, and `python evals/reflect_live.py` checks consolidation with your local model. All of it runs on synthetic data in throwaway stores; none of it opens a real store.
 
-Known limit: similarity scores cannot reliably tell "same topic" from "answers the question", so `match: "weak"` only catches the clearest cases of "nothing stored about this".
+### Optional: a reranker
+
+Similarity can tell that a memory is about the same topic as a question, not whether it answers it. Set `HIPPOCAMP_RERANKER=qwen3` and recall re-scores its best candidates with a local reranker (Qwen/Qwen3-Reranker-0.6B, ~1.2 GB, about 0.1 s per recall). The right memory is ranked first more often, and when nothing stored answers the question the results come back `match: "weak"` (94 % of unanswerable questions in the benchmark, against 28 % without). It is strict: roughly one answerable question in five is labelled weak too, so treat "weak" as "check before using", not "wrong".
+
+### Optional: EmbeddingGemma
+
+`hippocamp reindex --embedder embeddinggemma` switches a store to Google's EmbeddingGemma-300m served by a local OpenAI-compatible server (loopback only; `HIPPOCAMP_EMBED_URL`, `HIPPOCAMP_EMBED_MODEL`). It scored best in the benchmark. The server must be running whenever memory is used.
 
 ## Status
 

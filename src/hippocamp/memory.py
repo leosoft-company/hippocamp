@@ -69,6 +69,7 @@ class Memory:
         device_id: str | None = None,
         cache_dir: str | Path | None = None,
         force_embedder: bool = False,
+        reranker: Any | None = None,
     ) -> None:
         if embedder is None:
             from hippocamp.embedders import default_embedder
@@ -76,6 +77,7 @@ class Memory:
             embedder = default_embedder()
         self._embedder = embedder
         self._llm = llm
+        self._reranker = reranker
 
         self._meta: StoreMeta | None = None
         self._events: EventLog | None = None
@@ -409,6 +411,9 @@ class Memory:
                       query_tokens=query_tokens,
                       strong_similarity=getattr(self._embedder, "strong_similarity", None))
 
+        if self._reranker is not None and ranked:
+            ranked = self._rerank(query, ranked, limit, query_tokens)
+
         from hippocamp.ranker import NEAR_DUPLICATE_EPISODE, _cosine
 
         seen: set[tuple[str, str]] = set()
@@ -437,6 +442,23 @@ class Memory:
                            if (r.kind, normalise(r.text)) not in seen]
             results += rest[: limit - len(results)]
         return results
+
+    def _rerank(self, query, ranked, limit, query_tokens):
+        """Re-score the best candidates with the reranker: blend its verdict
+        into the order, and let it decide strong/weak (an exact identifier
+        match stays strong — "SK71 DMW" needs no second opinion)."""
+        from hippocamp.ranker import RERANK_TOP, W_RERANK
+
+        head = ranked[: max(RERANK_TOP, limit * 2)]
+        scores = self._reranker(query, [r.text for r in head])
+        bar = getattr(self._reranker, "strong_score", 0.5)
+        exact_ok = 0 < len(query_tokens) <= 3
+        for r, s in zip(head, scores):
+            r.why.rerank = float(s)
+            r.score = r.why.total = r.score + W_RERANK * float(s)
+            r.match = "strong" if s >= bar or (exact_ok and r.why.lexical == 1.0) else "weak"
+        head.sort(key=lambda r: r.score, reverse=True)
+        return head
 
     def _embed_query(self, text: str) -> list[float]:
         fn = getattr(self._embedder, "embed_query", None)

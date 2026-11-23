@@ -25,11 +25,17 @@ class CachedEmbedder:
     """Real Qwen embedder with an on-disk memo so re-runs are fast.
     Keeps the real embedder's name/dim so stores commit to the same model."""
 
-    def __init__(self):
-        from hippocamp.embedders import Qwen3Embedder
+    def __init__(self, which: str | None = None):
+        which = which or os.environ.get("EVAL_EMBEDDER", "qwen")
         t = time.time()
-        self.inner = Qwen3Embedder()
+        if which == "gemma":
+            from hippocamp.embedders import embeddinggemma
+            self.inner = embeddinggemma()
+        else:
+            from hippocamp.embedders import Qwen3Embedder
+            self.inner = Qwen3Embedder()
         self.load_s = time.time() - t
+        self._ns = "" if which == "qwen" else which + ":"
         self.name, self.dim = self.inner.name, self.inner.dim
         for attr in ("strong_similarity", "similar_statement"):
             if hasattr(self.inner, attr):
@@ -40,7 +46,7 @@ class CachedEmbedder:
 
     def __call__(self, text: str) -> list[float]:
         self.calls += 1
-        k = hashlib.sha1(text.encode()).hexdigest()
+        k = self._ns + hashlib.sha1(text.encode()).hexdigest()
         v = self.memo.get(k)
         if v is None:
             self.misses += 1
@@ -55,7 +61,7 @@ class CachedEmbedder:
         fn = getattr(self.inner, "embed_query", None)
         if fn is None:
             return self(text)
-        k = "q:" + hashlib.sha1(text.encode()).hexdigest()
+        k = self._ns + "q:" + hashlib.sha1(text.encode()).hexdigest()
         v = self.memo.get(k)
         if v is None:
             v = self.memo[k] = fn(text)
@@ -80,4 +86,18 @@ def clock(days_ago: float):
 def open_mem(store: Path, emb, device="eval-dev-a", llm=None):
     from hippocamp.memory import Memory
     return Memory(str(store), embedder=emb, device_id=device,
-                  cache_dir=str(store.parent / (store.name + "-cache")), llm=llm)
+                  cache_dir=str(store.parent / (store.name + "-cache")), llm=llm,
+                  reranker=reranker())
+
+
+_RR = []
+
+
+def reranker():
+    """The reranker under test, when EVAL_RERANKER=1 (loaded once)."""
+    if os.environ.get("EVAL_RERANKER") != "1":
+        return None
+    if not _RR:
+        from hippocamp.rerank import Qwen3Reranker
+        _RR.append(Qwen3Reranker())
+    return _RR[0]

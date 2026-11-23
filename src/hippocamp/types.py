@@ -18,6 +18,7 @@ class Why(BaseModel):
     kind_boost: float
     salience: float
     lexical: float = 0.0
+    rerank: float | None = None   # reranker's "this answers the question" score, if one is configured
     total: float
     note: str = ""
 

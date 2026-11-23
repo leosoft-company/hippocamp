@@ -182,6 +182,9 @@ for i, (t, _) in enumerate(D.noise(55, seed=11)): bm.observe(t, at=NOW() - timed
 t0 = time.time(); rep = bm.reflect()
 print("\nD report:", rep.model_dump(), f"{time.time() - t0:.0f}s")
 check("D: a 55-episode month-old backlog is read in full, in batches", rep.episodes_processed == 55 and rep.batches >= 3 and rep.pending == 0, f"{rep.batches} batches")
+junk = rows(bm)
+show("D: distilled from 55 one-off questions (ideally nothing)", junk)
+check("D: one-off questions are not turned into facts about the person", len(junk) <= 3, f"{len(junk)} items")
 emb.save(); (ROOT / "results").mkdir(exist_ok=True)
 (ROOT / "results" / "reflect_latest.json").write_text(json.dumps(OUT, indent=1, default=str))
 bad = [n for n, ok in CHECKS if not ok]

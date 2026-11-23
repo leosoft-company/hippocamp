@@ -36,6 +36,12 @@ Fitness work for household use — see docs/fitness-plan.md. Existing stores ope
 - Unreadable event-log lines are skipped with a warning instead of making the store unopenable.
 - Opening a store applies events other devices added since last time.
 
+### Optional components
+- Reranker: `HIPPOCAMP_RERANKER=qwen3` (or `Memory(reranker=...)`) re-scores the best candidates; better first-place ranking and a real "nothing stored answers this" signal. `Why.rerank` carries the score.
+- `LocalServerEmbedder` / `embeddinggemma()`: embeddings from a loopback OpenAI-compatible server; `reindex --embedder embeddinggemma`.
+- Local reflect adapter asks for schema-constrained JSON with thinking off (seconds instead of minutes per batch); prompt tightened so routine episodes yield nothing.
+- `hippocamp reflect --all` reflects every store in `$HIPPOCAMP_STORES`.
+
 ### Compatibility
 - New event ops `mark_reflected` and `purge`: a device still on 0.11 cannot read a log that contains them. Upgrade every device that shares a store.
 

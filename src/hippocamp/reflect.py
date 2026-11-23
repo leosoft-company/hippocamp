@@ -104,7 +104,15 @@ RULES:
   merge statements about different people into one.
 - Include plans and bookings with their dates ("holiday in Bergen, 12-19
   July"), deadlines and decisions; they stay useful until they pass.
-- Avoid one-shot trivia ("asked about today's weather", "set a timer").
+- Most episodes are routine and yield NOTHING. A question asked, a lookup,
+  a conversion, a timer, a recipe, a draft, a reminder, a bug fixed: these
+  are things that happened, not facts about the person. Do NOT turn them
+  into "is interested in X", "asked about X", "is working on X" or "needs
+  to do X". Returning empty lists is the correct answer for such a batch.
+- Write a fact or preference only when an episode STATES something lasting
+  about a person, the household or a project: who someone is, what they
+  have, where, when, what they like, what was decided or booked.
+- A recurring theme across three or more episodes may go in "reflections".
 - Ignore jokes and hypotheticals.
 - EXISTING_MEMORIES lists what is already stored, each with its id.
   * If an item says the same as an existing memory, SKIP it.
@@ -377,12 +385,38 @@ def _extract_json(text: str) -> str:
     return m.group(0)
 
 
+def _complete(llm: LLM, prompt: str) -> str:
+    """Call the model, handing it the reply schema when the adapter can use
+    one (constrained output: valid JSON by construction, and a thinking
+    model answers directly instead of deliberating for minutes)."""
+    if getattr(llm, "accepts_schema", False):
+        return llm.complete(prompt, system=SYSTEM_PROMPT, schema=DRAFT_SCHEMA)  # type: ignore[call-arg]
+    return llm.complete(prompt, system=SYSTEM_PROMPT)
+
+
+_ITEM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "text": {"type": "string"},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "replaces": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["text", "evidence", "replaces"],
+}
+DRAFT_SCHEMA = {
+    "type": "object",
+    "properties": {k: {"type": "array", "items": _ITEM_SCHEMA}
+                   for k in ("facts", "preferences", "reflections")},
+    "required": ["facts", "preferences", "reflections"],
+}
+
+
 def _call_and_parse(llm: LLM, prompt: str, *, retries: int = 1) -> ReflectionDraft:
     """Call LLM and parse its JSON output. Retry once on failure with a stricter nudge."""
     last_err: Exception | None = None
     current_prompt = prompt
     for attempt in range(retries + 1):
-        raw = llm.complete(current_prompt, system=SYSTEM_PROMPT)
+        raw = _complete(llm, current_prompt)
         try:
             blob = _extract_json(raw)
             data = json.loads(blob)
@@ -444,6 +478,8 @@ def local_llm(
     model: str | None = None,
     timeout: int = 900,
     max_tokens: int = 16000,
+    structured: bool | None = None,
+    reasoning_effort: str | None = None,
 ) -> LLM:
     """Build an LLM that calls an OpenAI-compatible server on this machine
     (LM Studio, llama.cpp server, Ollama's /v1, mlx_lm.server).
@@ -464,6 +500,17 @@ def local_llm(
             f"local reflect LLM must be on this machine (loopback); got {url!r}"
         )
     wanted = model or os.environ.get("HIPPOCAMP_LLM_MODEL") or None
+    if structured is None:
+        # On by default. HIPPOCAMP_LLM_STRUCTURED=0 for a server that
+        # rejects response_format.
+        structured = os.environ.get("HIPPOCAMP_LLM_STRUCTURED", "1").strip() != "0"
+    # Distilling is extraction, not problem solving. Measured with a
+    # thinking model (Gemma 4): left to think, a batch takes 1-3 minutes
+    # and can spend its whole output budget before answering; with thinking
+    # off and a schema it takes seconds and passes the same checks
+    # (evals/reflect_live.py). Set HIPPOCAMP_LLM_REASONING=default to leave
+    # the model's own setting alone, or to low/medium/high.
+    effort = reasoning_effort or os.environ.get("HIPPOCAMP_LLM_REASONING", "none").strip()
 
     def _call(path: str, payload: dict | None = None) -> dict:
         req = urllib.request.Request(
@@ -482,6 +529,7 @@ def local_llm(
 
     class _LocalLLM:
         base_url = url
+        accepts_schema = structured
 
         def _model(self) -> str:
             nonlocal wanted
@@ -493,17 +541,27 @@ def local_llm(
                 wanted = chat[0]
             return wanted
 
-        def complete(self, prompt: str, *, system: str | None = None) -> str:
+        def complete(
+            self, prompt: str, *, system: str | None = None, schema: dict | None = None
+        ) -> str:
             messages = []
             if system:
                 messages.append({"role": "system", "content": system})
             messages.append({"role": "user", "content": prompt})
-            data = _call("/v1/chat/completions", {
+            payload = {
                 "model": self._model(),
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": 0.2,
-            })
+            }
+            if effort and effort != "default":
+                payload["reasoning_effort"] = effort
+            if schema is not None:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "reply", "schema": schema},
+                }
+            data = _call("/v1/chat/completions", payload)
             try:
                 choice = data["choices"][0]
                 content = choice["message"]["content"] or ""

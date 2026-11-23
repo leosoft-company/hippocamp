@@ -1,8 +1,8 @@
 # Making Hippocamp fit for a household assistant
 
 Status (2026-11-23): phases 1–5 implemented; every behaviour test and every
-gating benchmark threshold passes. One target is open — flagging unanswerable
-questions (see "Open" at the end). Baseline numbers in brackets come from the
+gating benchmark threshold passes. The open items found along the way were
+then worked through — see "Open items: outcome" at the end. Baseline numbers in brackets come from the
 synthetic-family evaluation of v0.11.1.
 
 Results on the 3,073-memory store, right memory in the top three: dev
@@ -104,20 +104,41 @@ instead of a clock cutoff; batches; the model names what it replaces.
 - The embedder loads without contacting the network when the model is cached [contacts Hugging Face]
 - README matches the code
 
-## Open
+## Open items: outcome
 
-- **Flagging unanswerable questions.** Target: 70 % of questions the store
-  cannot answer come back marked weak. Achieved: 28–44 %, with 96 % of
-  answerable questions marked strong. No score-based signal separates the two
-  (best balanced accuracy 0.63–0.79 over similarity, gaps and z-scores, for
-  Qwen3 and EmbeddingGemma). It needs a reranker or a model judging
-  relevance. Reported by the benchmark, not gating.
-- **Embedder choice.** By similarity alone EmbeddingGemma-300m beats
-  Qwen3-0.6B on this data (large store, top three: 92 % vs 82 %); see
-  `evals/compare_embedders.py`. Switching needs an embedder adapter and a
-  `reindex` of each store.
-- **Inference questions** ("is satay sauce okay for the kids?") stay the
-  weakest category (50–62 % top three). Same remedy as the first point.
+Measured on the 3,073-memory store, dev / holdout questions.
+
+| Configuration | Ranked first | In top three | Unanswerable flagged | Answerable marked strong | Recall time |
+|---|---|---|---|---|---|
+| v0.11.1 | 46 % / 37 % | 57 % / 47 % | – | – | 14 ms |
+| Qwen3 (default) | 82 % / 86 % | 90 % / 93 % | 28 % | 97 % | 50 ms |
+| Qwen3 + reranker | 87 % / 86 % | 91 % / 95 % | 94 % | 80 % | 150 ms |
+| EmbeddingGemma + reranker | 91 % / 93 % | 96 % / 95 % | 94 % | 82 % | 150 ms |
+
+- **Flagging unanswerable questions — solved with an optional reranker.**
+  `HIPPOCAMP_RERANKER=qwen3` loads Qwen/Qwen3-Reranker-0.6B and re-scores the
+  best 20 candidates. It flags 94 % of unanswerable questions (target 70 %).
+  The cost: it is strict, so about one answerable question in five is also
+  labelled weak (the right memory is still returned). The tool note for
+  "nothing strong" is worded accordingly. Without a reranker `match` remains
+  a lenient floor.
+- **Inference questions** improve with the reranker (top three 50–62 % →
+  75 %). The rest need reasoning the retriever cannot do; the assistant has
+  to ask a second, better-aimed query.
+- **Embedder choice.** EmbeddingGemma-300m through a local server
+  (`hippocamp.embedders.embeddinggemma()`, `reindex --embedder
+  embeddinggemma`) is the best configuration measured. Switching a store is
+  a deliberate step: it needs the local server running for every recall and
+  a `reindex`.
+- **Reflect speed.** With a thinking model, reflect now asks for a
+  schema-constrained reply with thinking off: a 55-episode backlog went
+  from 501 s to under 10 s and the live checks still pass (13/13). The
+  prompt was tightened so routine episodes yield nothing.
+- **Every store, nightly.** `hippocamp reflect --all` reflects each store
+  in `$HIPPOCAMP_STORES`, one model conversation per store.
+
+Still true: recall takes ~50 ms (150 ms with the reranker), and embeddings
+are stored twice (~23 KB per memory).
 
 ## Not in this plan
 

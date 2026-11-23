@@ -112,6 +112,9 @@ def _resolve_embedder(name: str | None):
     if name_lc in ("bge-small", "bge-small-en", "bge-small-en-v1.5"):
         from hippocamp.embedders import BgeSmallEmbedder
         return BgeSmallEmbedder()
+    if name_lc in ("embeddinggemma", "embeddinggemma-300m", "gemma"):
+        from hippocamp.embedders import embeddinggemma
+        return embeddinggemma()
     if name_lc in ("hash", "hash-32"):
         from hippocamp.embedders import HashEmbedder
         return HashEmbedder()
@@ -236,7 +239,43 @@ def _sync_remote(mem, peer: str, *, no_replay: bool) -> int:
     return 0
 
 
+def _cmd_reflect_all(args: argparse.Namespace) -> int:
+    """Reflect every store in $HIPPOCAMP_STORES, one after another. Each
+    store gets its own model conversation; a failure in one is reported and
+    the rest still run."""
+    from hippocamp.mcp_server import STORES_ENV, parse_store_map
+
+    raw = os.environ.get(STORES_ENV, "")
+    if not raw.strip():
+        print(f"hippocamp: --all needs {STORES_ENV} (a JSON map of id -> directory)",
+              file=sys.stderr)
+        return 1
+    try:
+        stores = parse_store_map(raw)
+    except ValueError as e:
+        print(f"hippocamp: {e}", file=sys.stderr)
+        return 1
+    embedder = None
+    out: dict[str, dict] = {}
+    failed = False
+    for sid, path in stores.items():
+        try:
+            if embedder is None:
+                from hippocamp.embedders import default_embedder
+                embedder = default_embedder()   # loaded once for all stores
+            mem = Memory(path=str(path), embedder=embedder, llm=_resolve_llm(args.llm))
+            out[sid] = json.loads(mem.reflect(since=args.since).model_dump_json())
+            mem.close()
+        except (RuntimeError, ValueError) as e:
+            out[sid] = {"error": str(e)}
+            failed = True
+    print(json.dumps(out, indent=2))
+    return 1 if failed else 0
+
+
 def _cmd_reflect(args: argparse.Namespace) -> int:
+    if getattr(args, "all", False):
+        return _cmd_reflect_all(args)
     path = _resolve_path(args.path)
     if not path.exists():
         print(f"hippocamp: no store found at {path}", file=sys.stderr)
@@ -517,6 +556,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Distil recent episodes into facts/preferences/reflections via an LLM.",
     )
     p_reflect.add_argument("--path", default=None, help="Path to the store dir")
+    p_reflect.add_argument(
+        "--all", action="store_true",
+        help="Reflect every store listed in $HIPPOCAMP_STORES (for a nightly job).",
+    )
     p_reflect.add_argument(
         "--since",
         default=None,

@@ -73,9 +73,10 @@ def _recall(
 
 
 _NO_STRONG = (
-    "No stored memory is a strong match for this query. The results are only "
-    "the nearest things in the store; do not present them as the answer. Try "
-    "a differently worded query, or tell the user you have nothing on this."
+    "No stored memory is a strong match for this query. The results are the "
+    "nearest things in the store and may not answer it: read them, and use "
+    "one only if it really does. Otherwise try one differently worded query, "
+    "then tell the user you have nothing on this."
 )
 
 _KIND_OF_ACTION = {"assert_fact": "fact", "assert_preference": "preference"}
@@ -187,6 +188,9 @@ def parse_store_map(raw: str) -> dict[str, Path]:
     return out
 
 
+_UNSET = object()
+
+
 class StorePool:
     """Several separate stores behind one embedder.
 
@@ -202,6 +206,7 @@ class StorePool:
         embedder: Callable[[str], list[float]] | None = None,
         cache_dir: str | Path | None = None,
         device_id: str | None = None,
+        reranker: Any = None,
     ) -> None:
         if not stores:
             raise ValueError("StorePool needs at least one store")
@@ -209,6 +214,7 @@ class StorePool:
         self._embedder = embedder
         self._cache_dir = cache_dir
         self._device_id = device_id
+        self._reranker: Any = reranker
         self._open: dict[str, Memory] = {}
         # One lock for the whole pool: stores share the embedder, and the
         # SQLite connections are not meant for concurrent use.
@@ -230,11 +236,16 @@ class StorePool:
                     from hippocamp.embedders import default_embedder
 
                     self._embedder = default_embedder()
+                if self._reranker is _UNSET:
+                    from hippocamp.rerank import from_env
+
+                    self._reranker = from_env()   # loaded once, shared like the embedder
                 mem = Memory(
                     path=str(self._paths[store]),
                     embedder=self._embedder,
                     cache_dir=self._cache_dir,
                     device_id=self._device_id,
+                    reranker=self._reranker,
                 )
                 self._open[store] = mem
             return mem
@@ -506,12 +517,14 @@ def main() -> None:
     mem: Memory | None = None
     if raw_stores:
         try:
-            pool = StorePool(parse_store_map(raw_stores))
+            pool = StorePool(parse_store_map(raw_stores), reranker=_UNSET)
         except ValueError as e:
             raise SystemExit(f"hippocamp-mcp: {e}") from e
     else:
         DEFAULT_PATH.mkdir(parents=True, exist_ok=True)
-        mem = Memory(path=str(DEFAULT_PATH))
+        from hippocamp.rerank import from_env
+
+        mem = Memory(path=str(DEFAULT_PATH), reranker=from_env())
 
     # Lazy LLM init: only used by reflect_memory. Server starts fine
     # without one — the tool just raises a clear error if called.
