@@ -30,6 +30,10 @@ class RecallResult(BaseModel):
     why: Why
     created_at: datetime
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # "strong": this memory is about what was asked. "weak": it is merely the
+    # nearest thing in the store — treat a list of only weak results as
+    # "nothing relevant is stored".
+    match: Literal["strong", "weak"] = "weak"
 
 
 class RawRow(BaseModel):

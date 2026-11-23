@@ -86,7 +86,8 @@ def test_below_min_episodes_skips(mem_factory):
         since=datetime.now(timezone.utc) - timedelta(days=30),
         min_episodes=5,
     )
-    assert report.episodes_processed == 3
+    assert report.episodes_processed == 0
+    assert report.pending == 3  # left to accumulate, not dropped
     assert report.new_facts == 0
     assert llm.calls == []
 
@@ -125,8 +126,11 @@ def test_happy_path_writes_facts_prefs_reflections(mem_factory):
     assert inv.reflections == 1
 
 
-def test_dedup_into_supersede(mem_factory):
-    """When a near-duplicate fact already exists, the new fact supersedes it."""
+def test_restated_fact_is_kept_once(mem_factory):
+    """A fact the store already holds is not written again. (v0.11 replaced
+    any fact above a similarity threshold, which could swap one person's
+    fact for another's; replacement now needs an explicit `replaces` id —
+    see tests/test_fitness.py.)"""
 
     mem = mem_factory(llm=None)
     # Pre-seed an existing fact
@@ -148,13 +152,11 @@ def test_dedup_into_supersede(mem_factory):
     _seed_episodes(mem, 6, prefix="benefex")
     report = mem.reflect(since=datetime.now(timezone.utc) - timedelta(days=30))
 
-    assert report.new_facts == 1
-    assert report.superseded == 1
+    assert report.new_facts == 0
+    assert report.superseded == 0
 
-    # Old fact is now superseded; recall returns only the new one.
     hits = mem.recall("Benefex", kinds=["fact"], limit=5)
-    ids = [h.id for h in hits]
-    assert old_id not in ids
+    assert [h.id for h in hits] == [old_id]
 
 
 def test_hallucinated_evidence_is_dropped(mem_factory):
@@ -198,7 +200,8 @@ def test_lockfile_blocks_concurrent_run(tmp_path):
     """A held lockfile causes reflect() to refuse."""
     store_dir = tmp_path / "store"
     store_dir.mkdir()
-    (store_dir / ".reflect.lock").write_text("12345 running\n")
+    import os
+    (store_dir / ".reflect.lock").write_text(f"{os.getpid()} running\n")  # a live holder
 
     lock = _ReflectLock(store_dir)
     with pytest.raises(RuntimeError, match="locked by another process"):

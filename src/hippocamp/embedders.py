@@ -108,6 +108,11 @@ class Qwen3Embedder:
 
     name = "Qwen3-Embedding-0.6B"
     dim = 1024
+    # Calibrated on evals/ (see evals/tune.py). Query-to-memory similarity
+    # of a correct answer is rarely below this. It is a floor, not a judge:
+    # similarity alone cannot tell "about the same topic" from "answers it".
+    strong_similarity = 0.35
+    similar_statement = 0.60   # statement-to-statement: worth showing as "similar"
 
     def __init__(self, model_id: str = "Qwen/Qwen3-Embedding-0.6B") -> None:
         try:
@@ -117,10 +122,22 @@ class Qwen3Embedder:
                 "Qwen3Embedder requires sentence-transformers. "
                 "Install with: pip install 'hippocamp[embeddings]'"
             ) from e
-        self._model = SentenceTransformer(model_id)
+        # Once the model is on disk, load it without touching the network.
+        # Only a first run (nothing cached) is allowed to download.
+        try:
+            self._model = SentenceTransformer(model_id, local_files_only=True)
+        except Exception:
+            self._model = SentenceTransformer(model_id)
 
     def __call__(self, text: str) -> list[float]:
         vec = self._model.encode(text, normalize_embeddings=True)
+        return vec.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a *question*. Qwen3 is trained with an instruction on the
+        query side and none on the stored side; without it, short questions
+        land far from the memories that answer them."""
+        vec = self._model.encode(text, prompt_name="query", normalize_embeddings=True)
         return vec.tolist()
 
 

@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Protocol
@@ -41,9 +43,15 @@ class LLM(Protocol):
     def complete(self, prompt: str, *, system: str | None = None) -> str: ...
 
 
+class ReplyTruncated(RuntimeError):
+    """The model ran out of output tokens before finishing its answer."""
+
+
 class _Item(BaseModel):
     text: str
     evidence: list[str] = Field(default_factory=list)
+    # Ids of EXISTING memories this item updates or contradicts.
+    replaces: list[str] = Field(default_factory=list)
 
 
 class ReflectionDraft(BaseModel):
@@ -62,6 +70,8 @@ class ReflectionReport(BaseModel):
     new_reflections: int = 0
     superseded: int = 0
     episodes_processed: int = 0
+    batches: int = 0
+    pending: int = 0        # episodes still waiting after this run
     notes: str = ""
 
 
@@ -72,26 +82,39 @@ class ReflectionReport(BaseModel):
 
 SYSTEM_PROMPT = """\
 You are a memory distiller for a personal AI assistant. You receive a list
-of conversation episodes (the user's interactions with various AI hosts)
-and extract durable user-modelling content: stable facts, preferences, and
+of journal episodes (what people in a household told the assistant, or did
+with it) and extract durable content: stable facts, preferences, and
 patterns.
 
 OUTPUT a single JSON object with three keys:
-  - facts:        list of stable facts about the user/project/world
+  - facts:        list of stable facts about a person, the household, a project
   - preferences:  list of likes, dislikes, or working styles
   - reflections:  list of higher-order patterns spanning multiple episodes
 
 Each item has the shape:
-  {"text": "<the distilled statement>", "evidence": ["<episode_id>", ...]}
+  {"text": "<the distilled statement>", "evidence": ["<episode_id>", ...],
+   "replaces": ["<existing memory id>", ...]}
 
 RULES:
 - Extract only items GROUNDED in the episode content. Do not infer beyond
   what is stated in the episodes.
 - Each item MUST list at least one episode id from the input as evidence.
-- Phrase facts in third person about the user ("User works at X").
-- Avoid one-shot specifics ("user asked about today's weather"); aim for
-  stable patterns that would still be true next month.
-- Skip items already covered by EXISTING_FACTS (provided below).
+- Say WHO each item is about, by name when the episode gives one ("Theo is
+  allergic to peanuts"). Use "the user" only when no name is given. Never
+  merge statements about different people into one.
+- Include plans and bookings with their dates ("holiday in Bergen, 12-19
+  July"), deadlines and decisions; they stay useful until they pass.
+- Avoid one-shot trivia ("asked about today's weather", "set a timer").
+- Ignore jokes and hypotheticals.
+- EXISTING_MEMORIES lists what is already stored, each with its id.
+  * If an item says the same as an existing memory, SKIP it.
+  * If an item UPDATES or CONTRADICTS an existing memory about the same
+    person and subject (a new employer, a changed preference, a moved
+    appointment), write the new item and put the old memory's id in
+    "replaces". Only use ids that appear in EXISTING_MEMORIES.
+  * A similar statement about a DIFFERENT person or subject replaces
+    nothing.
+- When two episodes in the input disagree, the later one wins.
 - Output ONLY the JSON object. No prose, no markdown fences, no commentary.
 """
 
@@ -102,12 +125,27 @@ RULES:
 
 
 class _ReflectLock:
-    """File lock at <store_dir>/.reflect.lock with a stale-after-1h policy."""
+    """File lock at <store_dir>/.reflect.lock.
+
+    Holds "<pid> <iso time>". A lock whose process is gone (a crashed or
+    killed run) is taken over at once; one older than STALE_AFTER is taken
+    over whatever its process is doing.
+    """
 
     STALE_AFTER = timedelta(hours=1)
 
     def __init__(self, store_dir: Path | None) -> None:
         self._path = (store_dir / ".reflect.lock") if store_dir else None
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return True
+        return True
 
     def acquire(self) -> None:
         if self._path is None:
@@ -117,7 +155,12 @@ class _ReflectLock:
                 self._path.stat().st_mtime, tz=timezone.utc
             )
             age = datetime.now(timezone.utc) - mtime
-            if age < self.STALE_AFTER:
+            try:
+                pid = int(self._path.read_text().split()[0])
+            except (ValueError, IndexError, OSError):
+                pid = None
+            holder_gone = pid is not None and not self._alive(pid)
+            if age < self.STALE_AFTER and not holder_gone:
                 raise RuntimeError(
                     f"reflect() locked by another process (lock at {self._path}, "
                     f"age {age}). Wait, or delete the lock if certain it's stale."
@@ -125,6 +168,7 @@ class _ReflectLock:
         self._path.write_text(
             f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}\n"
         )
+        os.chmod(self._path, 0o600)
 
     def release(self) -> None:
         if self._path is None:
@@ -139,97 +183,170 @@ class _ReflectLock:
 # Main entry point
 # ---------------------------------------------------------------------------
 
+EPISODE_CHARS = 1500      # how much of one episode the model is shown
+EXISTING_PER_EPISODE = 3  # nearest stored facts/preferences fetched per episode
+EXISTING_CAP = 40         # ... and at most this many per batch
+
 
 def run_reflection(
     memory: "Memory",
     llm: LLM,
     *,
     since: str | datetime | None = None,
-    max_episodes: int = 50,
+    batch_size: int = 15,
+    max_batches: int = 20,
     min_episodes: int = 5,
-    dedup_threshold: float = 0.85,
-    default_lookback: timedelta = timedelta(days=7),
+    max_wait: timedelta = timedelta(hours=24),
+    max_episodes: int | None = None,
+    dedup_threshold: float | None = None,   # accepted for old callers; unused
+    default_lookback: timedelta | None = None,  # accepted for old callers; unused
 ) -> ReflectionReport:
-    """Distil recent episodes into facts/preferences/reflections.
+    """Distil episodes into facts/preferences/reflections.
 
-    Reads episodes since the resolved cutoff (`since` arg, else
-    `memory.last_reflect_at`, else now - default_lookback), sends them to
-    the LLM with the SYSTEM_PROMPT, validates the JSON output, and writes
-    the surviving items back to the memory. Near-duplicate facts (recall
-    similarity ≥ dedup_threshold) supersede the existing fact rather than
-    creating a parallel one.
+    Works through every episode consolidation has not read yet, oldest
+    first, in batches of `batch_size`. Each batch is one model call; when it
+    succeeds its episodes are marked as read (a `mark_reflected` event), so
+    nothing is read twice and nothing is skipped — however old an episode
+    is, however late it arrived from another device, and however many there
+    are. A failed call leaves its batch unread for the next run.
 
-    Persists `last_reflect_at` only on a successful pass — if the LLM call
-    or JSON parsing fails, the cutoff isn't advanced, so the next run
-    retries the same window.
+    Fewer than `min_episodes` pending are left to accumulate, unless the
+    oldest has already waited `max_wait`.
+
+    `since` re-reads everything from that time on regardless of marks
+    (repair / re-run). Exact repeats are not written twice.
+
+    For each batch the model is shown the stored facts and preferences
+    nearest to its episodes, with their ids. A new item replaces an old one
+    only when the model names that id — never on resemblance alone.
     """
-    cutoff = _resolve_since(memory, since, default_lookback)
-
+    if max_episodes:
+        batch_size = max_episodes
+    store = memory._store
     lock = _ReflectLock(memory.store_dir)
     lock.acquire()
     try:
-        episodes = memory._store.episodes_since(cutoff, limit=max_episodes)
-        if len(episodes) < min_episodes:
+        cap = batch_size * max_batches
+        if since is not None:
+            cutoff = since if isinstance(since, datetime) else datetime.fromisoformat(since)
+            episodes = store.episodes_since(cutoff, limit=cap)
+            waited = False
+        else:
+            _adopt_legacy_cutoff(memory)
+            episodes = store.episodes_pending(limit=cap)
+            waited = bool(episodes) and (
+                datetime.now(timezone.utc) - episodes[0].created_at > max_wait
+            )
+        if len(episodes) < min_episodes and not waited:
             return ReflectionReport(
-                episodes_processed=len(episodes),
+                episodes_processed=0,
+                pending=len(episodes),
                 notes=(
-                    f"Skipped: {len(episodes)} episodes since "
-                    f"{cutoff.isoformat()} is below min_episodes={min_episodes}."
+                    f"Skipped: {len(episodes)} episodes waiting is below "
+                    f"min_episodes={min_episodes}."
                 ),
             )
 
-        existing_facts = memory.recall(
-            query="user identity preferences habits work",
-            kinds=["fact", "preference"],
-            limit=30,
-        )
-
-        prompt = (
-            f"EPISODES:\n{_format_episodes(episodes)}\n\n"
-            f"EXISTING_FACTS:\n{_format_existing_facts(existing_facts)}\n"
-        )
-
-        draft = _call_and_parse(llm, prompt, retries=1)
-
-        valid_ids = {e.id for e in episodes}
-        report = ReflectionReport(episodes_processed=len(episodes))
-
-        for f in draft.facts:
-            evidence = [eid for eid in f.evidence if eid in valid_ids]
-            if not evidence:
+        report = ReflectionReport()
+        queue = [episodes[i:i + batch_size] for i in range(0, len(episodes), batch_size)]
+        while queue:
+            batch = queue.pop(0)
+            try:
+                _reflect_batch(memory, llm, batch, report)
+            except ReplyTruncated:
+                # A thinking model can burn its whole output budget on a
+                # large batch. Halve it and go again rather than fail the run.
+                if len(batch) < 2:
+                    raise
+                mid = len(batch) // 2
+                queue[:0] = [batch[:mid], batch[mid:]]
                 continue
-            sup = _find_supersede_target(memory, f.text, "fact", dedup_threshold)
-            memory.assert_fact(
-                f.text,
-                evidence=evidence,
-                supersedes=[sup] if sup else None,
-            )
-            report.new_facts += 1
-            if sup:
-                report.superseded += 1
-
-        for p in draft.preferences:
-            evidence = [eid for eid in p.evidence if eid in valid_ids]
-            if not evidence:
-                continue
-            # Preference's API doesn't yet support supersession; skip when
-            # a near-duplicate already exists to avoid parallel preferences.
-            if _find_supersede_target(memory, p.text, "preference", dedup_threshold):
-                continue
-            memory.assert_preference(p.text)
-            report.new_preferences += 1
-
-        for r in draft.reflections:
-            sources = [eid for eid in r.evidence if eid in valid_ids]
-            if not sources:
-                continue
-            memory.assert_reflection(r.text, sources=sources)
-            report.new_reflections += 1
-
+            memory.mark_reflected([e.id for e in batch])
+            report.episodes_processed += len(batch)
+            report.batches += 1
+        if since is None:
+            report.pending = len(store.episodes_pending(limit=cap))
         memory.set_last_reflect_at(datetime.now(timezone.utc))
         return report
     finally:
         lock.release()
+
+
+def _adopt_legacy_cutoff(memory: "Memory") -> None:
+    """One-time bridge from v0.11, which only kept `last_reflect_at`: treat
+    episodes older than that as already read, so an upgraded store does not
+    re-read its whole history. After this, only marks count."""
+    meta = memory.meta
+    if meta is None or meta.reflect_tracking:
+        return
+    if meta.last_reflect_at is not None:
+        done = memory._store.episodes_pending(limit=1_000_000, before=meta.last_reflect_at)
+        ids = [e.id for e in done]
+        for i in range(0, len(ids), 500):
+            memory.mark_reflected(ids[i:i + 500])
+    memory.set_reflect_tracking()
+
+
+def _reflect_batch(memory: "Memory", llm: LLM, batch: list, report: ReflectionReport) -> None:
+    existing = _relevant_existing(memory, batch)
+    prompt = (
+        f"EPISODES:\n{_format_episodes(batch)}\n\n"
+        f"EXISTING_MEMORIES:\n{_format_existing_facts(existing)}\n"
+    )
+    draft = _call_and_parse(llm, prompt, retries=1)
+
+    valid_ids = {e.id for e in batch}
+    shown = {m.id: m.kind for m in existing}
+    store = memory._store
+
+    def replaced(item: _Item, kind: str) -> list[str]:
+        # Only ids the model was actually shown, of the same kind, still active.
+        return [i for i in dict.fromkeys(item.replaces)
+                if shown.get(i) == kind and store.state(i) == "active"]
+
+    for f in draft.facts:
+        evidence = [eid for eid in f.evidence if eid in valid_ids]
+        if not evidence or not f.text.strip():
+            continue
+        sup = replaced(f, "fact")
+        is_new = store.find_duplicate("fact", f.text) is None
+        memory.assert_fact(f.text, evidence=evidence, supersedes=sup or None)
+        report.new_facts += is_new
+        report.superseded += len(sup)
+
+    for p in draft.preferences:
+        evidence = [eid for eid in p.evidence if eid in valid_ids]
+        if not evidence or not p.text.strip():
+            continue
+        sup = replaced(p, "preference")
+        is_new = store.find_duplicate("preference", p.text) is None
+        memory.assert_preference(p.text, supersedes=sup or None)
+        report.new_preferences += is_new
+        report.superseded += len(sup)
+
+    for r in draft.reflections:
+        sources = [eid for eid in r.evidence if eid in valid_ids]
+        if not sources or not r.text.strip():
+            continue
+        is_new = store.find_duplicate("reflection", r.text) is None
+        memory.assert_reflection(r.text, sources=sources)
+        report.new_reflections += is_new
+
+
+def _relevant_existing(memory: "Memory", batch: list) -> list:
+    """Stored facts and preferences closest to this batch's episodes — what
+    the model needs in front of it to spot a repeat or an update."""
+    out: dict[str, object] = {}
+    for e in batch:
+        rows = memory._store.search(
+            query_emb=e.embedding, kinds=["fact", "preference"],
+            candidate_limit=EXISTING_PER_EPISODE,
+        )
+        for r in rows[:EXISTING_PER_EPISODE]:
+            out.setdefault(r.id, r)
+        if len(out) >= EXISTING_CAP:
+            break
+    return list(out.values())[:EXISTING_CAP]
 
 
 # ---------------------------------------------------------------------------
@@ -237,26 +354,11 @@ def run_reflection(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_since(
-    memory: "Memory",
-    since: str | datetime | None,
-    default_lookback: timedelta,
-) -> datetime:
-    if isinstance(since, datetime):
-        return since
-    if isinstance(since, str):
-        return datetime.fromisoformat(since)
-    last = memory.last_reflect_at
-    if last is not None:
-        return last
-    return datetime.now(timezone.utc) - default_lookback
-
-
 def _format_episodes(episodes: Iterable["RawRow"]) -> str:
     lines = []
     for e in episodes:
         date = e.created_at.date().isoformat()
-        snippet = e.text.replace("\n", " ")[:300]
+        snippet = e.text.replace("\n", " ")[:EPISODE_CHARS]
         lines.append(f"[{e.id}] {date} {snippet}")
     return "\n".join(lines)
 
@@ -264,7 +366,7 @@ def _format_episodes(episodes: Iterable["RawRow"]) -> str:
 def _format_existing_facts(facts) -> str:
     if not facts:
         return "(none)"
-    return "\n".join(f"- {f.text}" for f in facts[:30])
+    return "\n".join(f"[{f.id}] ({f.kind}) {f.text}" for f in facts)
 
 
 def _extract_json(text: str) -> str:
@@ -298,24 +400,128 @@ def _call_and_parse(llm: LLM, prompt: str, *, retries: int = 1) -> ReflectionDra
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
-def _find_supersede_target(
-    memory: "Memory",
-    text: str,
-    kind: str,
-    threshold: float,
-) -> str | None:
-    """Recall the most-similar existing memory of `kind`. Return its id if sim >= threshold."""
-    hits = memory.recall(query=text, kinds=[kind], limit=3)
-    if not hits:
-        return None
-    top = hits[0]
-    if top.why.similarity >= threshold:
-        return top.id
-    return None
+# ---------------------------------------------------------------------------
+# Bundled local adapter (the default)
+# ---------------------------------------------------------------------------
+
+# Reflection reads private memory. By default that text stays on this
+# machine: the only adapter the CLI and MCP server pick on their own is the
+# local one, and it refuses any server that isn't on loopback. The cloud
+# adapters below run only when asked for by name AND this is set to 1.
+CLOUD_OPT_IN_ENV = "HIPPOCAMP_ALLOW_CLOUD_REFLECT"
+DEFAULT_LOCAL_URL = "http://127.0.0.1:1234"  # LM Studio's server
+
+
+def cloud_reflect_allowed() -> bool:
+    return os.environ.get(CLOUD_OPT_IN_ENV, "").strip() == "1"
+
+
+def _require_cloud_opt_in(adapter: str) -> None:
+    if not cloud_reflect_allowed():
+        raise RuntimeError(
+            f"the {adapter} adapter would send memory text to a cloud model; "
+            f"refusing. Reflection runs on a local model by default. To allow "
+            f"this on purpose, set {CLOUD_OPT_IN_ENV}=1."
+        )
+
+
+def _is_loopback(url: str) -> bool:
+    import ipaddress
+    from urllib.parse import urlparse
+
+    host = (urlparse(url).hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def local_llm(
+    *,
+    base_url: str | None = None,
+    model: str | None = None,
+    timeout: int = 900,
+    max_tokens: int = 16000,
+) -> LLM:
+    """Build an LLM that calls an OpenAI-compatible server on this machine
+    (LM Studio, llama.cpp server, Ollama's /v1, mlx_lm.server).
+
+    ``base_url`` defaults to HIPPOCAMP_LLM_URL, else http://127.0.0.1:1234.
+    It must be a loopback address — anything else raises RuntimeError, so a
+    mistyped or hostile setting can't turn "local" into a remote server.
+    ``model`` defaults to HIPPOCAMP_LLM_MODEL, else the first non-embedding
+    model the server lists. The server is first contacted on ``complete()``,
+    so building the adapter works while the server is down.
+    """
+    import urllib.error
+    import urllib.request
+
+    url = (base_url or os.environ.get("HIPPOCAMP_LLM_URL") or DEFAULT_LOCAL_URL).rstrip("/")
+    if not _is_loopback(url):
+        raise RuntimeError(
+            f"local reflect LLM must be on this machine (loopback); got {url!r}"
+        )
+    wanted = model or os.environ.get("HIPPOCAMP_LLM_MODEL") or None
+
+    def _call(path: str, payload: dict | None = None) -> dict:
+        req = urllib.request.Request(
+            url + path,
+            data=json.dumps(payload).encode() if payload is not None else None,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise RuntimeError(
+                f"local LLM server at {url} did not answer ({e}); start it "
+                "(e.g. `lms server start`) and try again"
+            ) from e
+
+    class _LocalLLM:
+        base_url = url
+
+        def _model(self) -> str:
+            nonlocal wanted
+            if wanted is None:
+                ids = [m.get("id", "") for m in _call("/v1/models").get("data", [])]
+                chat = [i for i in ids if i and "embed" not in i.lower()]
+                if not chat:
+                    raise RuntimeError(f"local LLM server at {url} lists no chat model")
+                wanted = chat[0]
+            return wanted
+
+        def complete(self, prompt: str, *, system: str | None = None) -> str:
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+            data = _call("/v1/chat/completions", {
+                "model": self._model(),
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.2,
+            })
+            try:
+                choice = data["choices"][0]
+                content = choice["message"]["content"] or ""
+            except (KeyError, IndexError, TypeError) as e:
+                raise RuntimeError(f"unexpected reply from local LLM server: {e}") from e
+            if choice.get("finish_reason") == "length":
+                # A thinking model can spend the whole budget before it
+                # starts the answer. Say so instead of returning half a reply.
+                raise ReplyTruncated(
+                    f"local LLM reply was cut off at max_tokens={max_tokens}"
+                )
+            return content
+
+    return _LocalLLM()
 
 
 # ---------------------------------------------------------------------------
-# Bundled Anthropic adapter
+# Bundled Anthropic adapter (cloud — opt-in only)
 # ---------------------------------------------------------------------------
 
 
@@ -330,9 +536,12 @@ def default_anthropic_llm(
     the environment. Raises RuntimeError if either is missing.
 
     Hippocamp does not require this — any object with a `.complete(...)`
-    method can be passed via `Memory(llm=...)`. This is just the default
-    convenience for users who don't want to write their own adapter.
+    method can be passed via `Memory(llm=...)`.
+
+    Sends memory text to Anthropic, so it refuses to run unless
+    HIPPOCAMP_ALLOW_CLOUD_REFLECT=1 is set.
     """
+    _require_cloud_opt_in("Anthropic API")
     try:
         import anthropic  # type: ignore
     except ImportError as e:
@@ -359,3 +568,59 @@ def default_anthropic_llm(
             )
 
     return _AnthropicLLM()
+
+
+# ---------------------------------------------------------------------------
+# Bundled Claude Code CLI adapter (cloud — opt-in only)
+# ---------------------------------------------------------------------------
+
+# Fallback locations for hosts that spawn the server with a minimal PATH
+# (e.g. Claude Desktop launched from Finder on macOS).
+_CLAUDE_CLI_CANDIDATES = (
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+    str(Path.home() / ".local" / "bin" / "claude"),
+)
+
+
+def claude_cli_llm(
+    *,
+    model: str = "haiku",
+    timeout: int = 900,
+) -> LLM:
+    """Build an LLM that shells out to the Claude Code CLI (`claude -p`).
+
+    Authenticates via the local Claude Code login — no ANTHROPIC_API_KEY
+    required. Raises RuntimeError if the `claude` binary can't be found.
+
+    Sends memory text to Anthropic, so it refuses to run unless
+    HIPPOCAMP_ALLOW_CLOUD_REFLECT=1 is set.
+    """
+    _require_cloud_opt_in("Claude Code CLI")
+    binary = shutil.which("claude")
+    if binary is None:
+        binary = next(
+            (c for c in _CLAUDE_CLI_CANDIDATES if os.path.exists(c)), None
+        )
+    if binary is None:
+        raise RuntimeError(
+            "claude CLI not found on PATH — install Claude Code or set "
+            "ANTHROPIC_API_KEY to use the API adapter instead"
+        )
+
+    class _ClaudeCLILLM:
+        def complete(self, prompt: str, *, system: str | None = None) -> str:
+            cmd = [binary, "-p", "--model", model]
+            if system:
+                cmd += ["--system-prompt", system]
+            result = subprocess.run(
+                cmd, input=prompt, capture_output=True, text=True, timeout=timeout
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"claude CLI failed (exit {result.returncode}): "
+                    f"{result.stderr.strip()}"
+                )
+            return result.stdout
+
+    return _ClaudeCLILLM()
