@@ -15,15 +15,55 @@ Most AI memory is a flat bag of strings — every "thing remembered" treated the
 - **Preferences** — what the user wants, with a strength.
 - **Reflections** — higher-order patterns the system distils across many episodes via an LLM (consolidation, via `reflect`).
 
-Each kind has its own retrieval weight, its own decay curve, its own supersession rules. Recall a fact and you get the *latest* assertion (older ones are superseded). Recall an event and recency dominates. Recall a reflection and you get a pattern that spans weeks. Every result comes back with a **why-trace** — similarity + recency + kind-boost + salience — so you (and the model) can see exactly why a memory ranked where it did.
+Each kind is ranked on its own terms. Relevance to the question decides; kind and age only break ties. Facts, preferences and reflections do not fade with age — they stay true until replaced — while episodes lose a little ground as they get older. Replace a fact (`supersedes`) and the old one stops coming back. Every result comes back with a **why-trace** (similarity, wording overlap, kind, age) and a `match` label: "strong" when it is about the question, "weak" when it is only the nearest thing stored.
 
 And it's local. ChatGPT's memory works only in ChatGPT; Claude Code's only in Claude Code; cloud agent-memory services (Mem0, Zep, Letta) put your data on their servers. Hippocamp lives in a directory you control, and any AI that speaks MCP can read or write it — so the same tiered memory follows you across every host and every machine you own.
 
 The supporting wedges:
 
-- **First-class forgetting** — supersedence, TTL, and tombstones are features, not afterthoughts.
+- **First-class forgetting** — replace a memory, forget it, expire by age, or purge it so the text is erased from the log and the cache (`hippocamp forget --purge`, `expire`, `compact`).
 - **Conflict-free sync** — each device writes to `events/<device_id>.jsonl`, so no two machines ever touch the same file. Every cloud-sync service handles this safely by definition.
 - **Local-first** — the SQLite index lives on each machine; `events/` is the portable source of truth. Wipe the cache anytime; `hippocamp sync` rebuilds it.
+
+## Architecture at a glance
+
+```mermaid
+flowchart TD
+    subgraph hosts["Any AI host, any machine"]
+        direction LR
+        CC["Claude Code"]
+        CD["Claude Desktop"]
+        CU["Cursor"]
+        GPT["ChatGPT"]
+        CA["Custom agent"]
+    end
+
+    hosts <-->|MCP| server["<b>hippocamp MCP server</b><br/>update_memory · recall_memory · reflect_memory"]
+
+    server -->|"write path"| kinds
+
+    subgraph kinds["Four kinds, distinct semantics"]
+        direction LR
+        EP["<b>Episode</b><br/>what happened,<br/>timestamped"]
+        FA["<b>Fact</b><br/>what is true;<br/>supersedes older"]
+        PR["<b>Preference</b><br/>what the user wants,<br/>with strength"]
+        RE["<b>Reflection</b><br/>LLM-distilled patterns<br/>across episodes"]
+        EP -. "reflect (consolidation)" .-> RE
+    end
+
+    kinds --> EV
+
+    subgraph store["Local-first storage"]
+        EV["events/&lt;device_id&gt;.jsonl<br/>append-only source of truth<br/>one file per device — conflict-free"]
+        IX["SQLite index + embeddings<br/>disposable local cache"]
+        EV -->|"hippocamp sync (rebuild)"| IX
+    end
+
+    IX --> ranker["<b>Ranker</b> — every result carries a why-trace:<br/>similarity × recency × kind-boost + salience"]
+    ranker -->|"read path: ranked recall"| server
+
+    EV <-->|"any file sync<br/>Dropbox · iCloud · Syncthing · rsync"| other["Other devices<br/>each writes only its own events file"]
+```
 
 ---
 
@@ -78,14 +118,62 @@ If something gets saved that you don't want, just say *"forget that"* in convers
 
 Raw episodes pile up fast. Periodically Hippocamp runs an LLM pass that reads recent episodes, distils out the durable user-modelling content (facts, preferences, higher-order reflections), and writes it back. Near-duplicate facts are *superseded*, not duplicated — so recall surfaces clean signal instead of noisy repetition.
 
+Reflect works through every episode it has not read yet, oldest first, in small batches, and records which ones it has read — so nothing is skipped however old it is or however late it arrived from another device. The model is shown the stored memories closest to each batch; a new fact replaces an old one only when the model names it, never on resemblance alone.
+
 Run it on demand, or on a cron:
 
 ```bash
-hippocamp reflect                     # uses meta.last_reflect_at as cutoff
-hippocamp reflect --since 2026-05-01  # explicit cutoff
+hippocamp reflect                     # local model; everything not yet read
+hippocamp reflect --since 2026-05-01  # re-read from a date (repeats are not stored twice)
+hippocamp reflect --all               # every store in $HIPPOCAMP_STORES (for a nightly job)
 ```
 
-Requires an LLM. The bundled adapter calls Anthropic — install with `pip install 'hippocamp[llm]'` and set `ANTHROPIC_API_KEY`. Or pass any object with a `complete(prompt, *, system) -> str` method via `Memory(llm=...)`. The MCP `reflect_memory` tool is also auto-exposed when the server boots with `ANTHROPIC_API_KEY` set, so Claude can call it directly when you ask to "consolidate" or "refresh what you know about me".
+Reflection reads your private memory, so by default it runs on a **local model** and nothing leaves the machine:
+
+1. **Local (default)** — any OpenAI-compatible server on this machine (LM Studio, llama.cpp server, Ollama's `/v1`, `mlx_lm.server`). Defaults to `http://127.0.0.1:1234` and the first chat model it lists; override with `HIPPOCAMP_LLM_URL` and `HIPPOCAMP_LLM_MODEL`. A non-loopback URL is refused. The reply is requested as schema-constrained JSON with thinking off, which takes a thinking model from minutes to seconds per batch (`HIPPOCAMP_LLM_STRUCTURED=0` and `HIPPOCAMP_LLM_REASONING=default` turn those off).
+2. **Bring your own** — pass any object with a `complete(prompt, *, system) -> str` method via `Memory(llm=...)`.
+3. **Cloud, only on purpose** — `hippocamp reflect --llm anthropic` (needs `pip install 'hippocamp[llm]'` and `ANTHROPIC_API_KEY`) or `--llm claude-cli`. Both send episode text to Anthropic and refuse to run unless `HIPPOCAMP_ALLOW_CLOUD_REFLECT=1` is set. Neither is ever chosen automatically.
+
+The MCP server's `reflect_memory` tool uses the local model too, and fails with a clear error if the local server isn't running — it never falls back to a cloud model.
+
+## Several stores, one server
+
+One `hippocamp-mcp` process can hold several separate stores — one per
+person in a household, plus a shared one — behind a single embedder, so
+the model is loaded once however many stores there are.
+
+Set `HIPPOCAMP_STORES` to a JSON object of store id → directory:
+
+```bash
+HIPPOCAMP_STORES='{"alice": "~/.hippocamp", "bob": "~/people/bob/memory", "home": "~/household/memory"}' hippocamp-mcp
+```
+
+In this mode every tool call names the store it acts on:
+
+| Tool | Argument | Meaning |
+|---|---|---|
+| `recall_memory` | `stores` (required, list) | Stores to search. With more than one, results are merged by score and each carries the `store` it came from. |
+| `update_memory` | `store` (required) | The one store to write to. Memory ids are per store. |
+| `reflect_memory` | `store` (required) | The one store to reflect over. |
+
+What this is and is not:
+
+- **The id selects a store; it is not a filter.** Each store keeps its own
+  directory, event log and cache. A query can only return what is in the
+  stores it named.
+- **Ids come from the fixed map.** An id outside it is refused, and the
+  error does not list the valid ones, so an id can never become a path.
+- **It is not access control between callers.** Any client of the server
+  can name any id in the map. Use it behind a harness that fills the
+  argument in itself and never lets a model choose it.
+- **All stores must use the same embedder.** A store committed to a
+  different one is refused when first opened; the others keep working.
+- **Without `HIPPOCAMP_STORES` nothing changes:** one store at
+  `HIPPOCAMP_PATH`, and the tools take no store argument.
+
+Create a new empty store with `hippocamp init --path <dir>`. Reflect and
+sync stay per store: `hippocamp reflect --path <dir>`. Never `hippocamp
+sync` one person's store into another's — it copies whole event files.
 
 ## What just happened
 
@@ -116,6 +204,11 @@ hippocamp instructions                # print the directive (full)
 hippocamp instructions --short        # compact version (paste into Claude Desktop / ChatGPT custom instructions)
 
 hippocamp reindex [--embedder NAME]   # recompute embeddings (after a model swap)
+
+hippocamp forget <id>                 # stop returning a memory (text stays in the log)
+hippocamp forget <id> --purge         # ...and erase its text from the log and cache
+hippocamp expire --before 90d --kind episode   # forget by age (TTL)
+hippocamp compact                     # erase the text of everything already forgotten
 
 hippocamp reflect                     # consolidate recent episodes (requires LLM)
 hippocamp reflect --since <iso-ts>    # explicit cutoff instead of meta.last_reflect_at
@@ -156,9 +249,21 @@ hippocamp setup claude --project-instructions ~/projects/myapp
 # → also writes ~/projects/myapp/CLAUDE.md with the same block
 ```
 
+## Quality checks
+
+`pytest` runs the behaviour tests (`tests/test_fitness.py` pins every fix in [docs/fitness-plan.md](docs/fitness-plan.md)). `python evals/recall_bench.py` measures recall on a made-up household against the minimums in `evals/thresholds.json`, and `python evals/reflect_live.py` checks consolidation with your local model. All of it runs on synthetic data in throwaway stores; none of it opens a real store.
+
+### Optional: a reranker
+
+Similarity can tell that a memory is about the same topic as a question, not whether it answers it. Set `HIPPOCAMP_RERANKER=qwen3` and recall re-scores its best candidates with a local reranker (Qwen/Qwen3-Reranker-0.6B, ~1.2 GB, about 0.1 s per recall). The right memory is ranked first more often, and when nothing stored answers the question the results come back `match: "weak"` (94 % of unanswerable questions in the benchmark, against 28 % without). It is strict: roughly one answerable question in five is labelled weak too, so treat "weak" as "check before using", not "wrong".
+
+### Optional: EmbeddingGemma
+
+`hippocamp reindex --embedder embeddinggemma` switches a store to Google's EmbeddingGemma-300m served by a local OpenAI-compatible server (loopback only; `HIPPOCAMP_EMBED_URL`, `HIPPOCAMP_EMBED_MODEL`). It scored best in the benchmark. The server must be running whenever memory is used.
+
 ## Status
 
-**v0.5.0 (alpha).** Architecture stable. Ambient memory is live on Claude Code (the directive auto-installs into `~/.claude/CLAUDE.md`); Claude Desktop requires a one-time paste from `hippocamp instructions --short` into Settings → Profile. One `hippocamp setup claude` command configures Claude Code and Claude Desktop together when both are installed. LLM-driven consolidation (`reflect`) ships in this release. Cross-machine sync works through any file-sync tool you already use (iCloud, Dropbox, Syncthing, rsync, git). **Roadmap to v1.0:** encryption at rest, event-log compaction / snapshotting, HTTP/SSE transport for self-hosted always-on stores.
+**v0.12 (alpha, unreleased).** Architecture stable. Ambient memory is live on Claude Code (the directive auto-installs into `~/.claude/CLAUDE.md`); Claude Desktop requires a one-time paste from `hippocamp instructions --short` into Settings → Profile. One `hippocamp setup claude` command configures Claude Code and Claude Desktop together when both are installed. LLM-driven consolidation (`reflect`) ships in this release. Cross-machine sync works through any file-sync tool you already use (iCloud, Dropbox, Syncthing, rsync, git). **Roadmap to v1.0:** encryption at rest, event-log compaction / snapshotting, HTTP/SSE transport for self-hosted always-on stores.
 
 ## License
 

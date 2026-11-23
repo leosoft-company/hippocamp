@@ -17,6 +17,8 @@ class Why(BaseModel):
     recency: float
     kind_boost: float
     salience: float
+    lexical: float = 0.0
+    rerank: float | None = None   # reranker's "this answers the question" score, if one is configured
     total: float
     note: str = ""
 
@@ -29,6 +31,10 @@ class RecallResult(BaseModel):
     why: Why
     created_at: datetime
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # "strong": this memory is about what was asked. "weak": it is merely the
+    # nearest thing in the store — treat a list of only weak results as
+    # "nothing relevant is stored".
+    match: Literal["strong", "weak"] = "weak"
 
 
 class RawRow(BaseModel):

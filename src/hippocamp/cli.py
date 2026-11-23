@@ -112,6 +112,9 @@ def _resolve_embedder(name: str | None):
     if name_lc in ("bge-small", "bge-small-en", "bge-small-en-v1.5"):
         from hippocamp.embedders import BgeSmallEmbedder
         return BgeSmallEmbedder()
+    if name_lc in ("embeddinggemma", "embeddinggemma-300m", "gemma"):
+        from hippocamp.embedders import embeddinggemma
+        return embeddinggemma()
     if name_lc in ("hash", "hash-32"):
         from hippocamp.embedders import HashEmbedder
         return HashEmbedder()
@@ -236,7 +239,43 @@ def _sync_remote(mem, peer: str, *, no_replay: bool) -> int:
     return 0
 
 
+def _cmd_reflect_all(args: argparse.Namespace) -> int:
+    """Reflect every store in $HIPPOCAMP_STORES, one after another. Each
+    store gets its own model conversation; a failure in one is reported and
+    the rest still run."""
+    from hippocamp.mcp_server import STORES_ENV, parse_store_map
+
+    raw = os.environ.get(STORES_ENV, "")
+    if not raw.strip():
+        print(f"hippocamp: --all needs {STORES_ENV} (a JSON map of id -> directory)",
+              file=sys.stderr)
+        return 1
+    try:
+        stores = parse_store_map(raw)
+    except ValueError as e:
+        print(f"hippocamp: {e}", file=sys.stderr)
+        return 1
+    embedder = None
+    out: dict[str, dict] = {}
+    failed = False
+    for sid, path in stores.items():
+        try:
+            if embedder is None:
+                from hippocamp.embedders import default_embedder
+                embedder = default_embedder()   # loaded once for all stores
+            mem = Memory(path=str(path), embedder=embedder, llm=_resolve_llm(args.llm))
+            out[sid] = json.loads(mem.reflect(since=args.since).model_dump_json())
+            mem.close()
+        except (RuntimeError, ValueError) as e:
+            out[sid] = {"error": str(e)}
+            failed = True
+    print(json.dumps(out, indent=2))
+    return 1 if failed else 0
+
+
 def _cmd_reflect(args: argparse.Namespace) -> int:
+    if getattr(args, "all", False):
+        return _cmd_reflect_all(args)
     path = _resolve_path(args.path)
     if not path.exists():
         print(f"hippocamp: no store found at {path}", file=sys.stderr)
@@ -260,16 +299,85 @@ def _cmd_reflect(args: argparse.Namespace) -> int:
 
 
 def _resolve_llm(name: str | None):
-    """Look up a named LLM adapter. Default: anthropic Claude Haiku.
+    """Look up a named LLM adapter.
 
-    Hippocamp ships a thin Anthropic adapter; users wanting a different
-    provider should call `Memory(llm=...)` from Python directly.
+    Default ("local"; "auto" means the same): an OpenAI-compatible server on
+    this machine. Reflection never picks a cloud model on its own — the
+    'anthropic' and 'claude-cli' adapters must be named explicitly AND need
+    HIPPOCAMP_ALLOW_CLOUD_REFLECT=1, whatever keys or CLIs are present.
     """
-    name = (name or "anthropic").lower()
+    name = (name or "local").lower()
+    if name in ("local", "auto"):
+        from hippocamp.reflect import local_llm
+        return local_llm()
     if name in ("anthropic", "claude"):
         from hippocamp.reflect import default_anthropic_llm
         return default_anthropic_llm()
+    if name in ("claude-cli", "cli"):
+        from hippocamp.reflect import claude_cli_llm
+        return claude_cli_llm()
     raise ValueError(f"unknown llm: {name!r}")
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    """Create an empty store at --path, committed to this machine's embedder.
+
+    Opening a store creates it, so this is mostly a named, explicit way to
+    do that — and it refuses a directory that already holds memories, so a
+    typo can't be mistaken for a fresh store.
+    """
+    path = Path(args.path).expanduser()
+    existed = (path / "meta.json").exists()
+    mem = Memory(path=str(path))
+    inv = mem.inspect()
+    total = inv.episodes + inv.facts + inv.preferences + inv.reflections
+    if existed:
+        print(f"hippocamp: store already exists at {mem.store_dir} ({total} memories)")
+        return 1 if total else 0
+    print(f"created store: {mem.store_dir}")
+    print(f"embedder:      {mem.meta.embedder if mem.meta else '(none)'}")
+    print(f"cache path:    {mem.cache_path}")
+    return 0
+
+
+def _cmd_forget(args: argparse.Namespace) -> int:
+    """Forget one memory by id; with --purge, also erase its text from disk."""
+    mem = _open_memory(args.path)
+    try:
+        if args.purge and mem._store.state(args.id) is None:
+            raise ValueError(f"cannot purge {args.id!r}: no such memory")
+        if mem._store.state(args.id) == "active":
+            mem.forget(args.id)
+        elif mem._store.state(args.id) is None:
+            mem.forget(args.id)  # raises: no such memory
+        if args.purge:
+            mem.purge(args.id)
+    except ValueError as e:
+        print(f"hippocamp: {e}", file=sys.stderr)
+        return 1
+    print(f"{'purged' if args.purge else 'forgot'} {args.id}")
+    return 0
+
+
+def _cmd_expire(args: argparse.Namespace) -> int:
+    """Forget every active memory older than --before."""
+    mem = _open_memory(args.path)
+    try:
+        n = mem.expire_before(args.before, kinds=args.kind or None)
+    except ValueError as e:
+        print(f"hippocamp: {e}", file=sys.stderr)
+        return 1
+    print(f"forgot {n} memories created before {args.before}"
+          + (" (run `hippocamp compact` to erase their text)" if n else ""))
+    return 0
+
+
+def _cmd_compact(args: argparse.Namespace) -> int:
+    """Erase the text of everything that was forgotten, log and cache."""
+    mem = _open_memory(args.path)
+    report = mem.compact()
+    print(f"purged {report.dropped} forgotten memories")
+    return 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -379,6 +487,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_sync.set_defaults(func=_cmd_sync)
 
+    p_init = sub.add_parser(
+        "init", help="Create a new, empty store directory."
+    )
+    p_init.add_argument("--path", required=True, help="Directory for the new store")
+    p_init.set_defaults(func=_cmd_init)
+
+    p_forget = sub.add_parser("forget", help="Forget one memory by id.")
+    p_forget.add_argument("id", help="Memory id (as shown by recall), e.g. fa_1a2b3c")
+    p_forget.add_argument("--path", default=None, help="Path to the store dir")
+    p_forget.add_argument(
+        "--purge", action="store_true",
+        help="Also erase its text from the event log and cache (cannot be undone).",
+    )
+    p_forget.set_defaults(func=_cmd_forget)
+
+    p_expire = sub.add_parser(
+        "expire", help="Forget memories older than a cutoff (TTL)."
+    )
+    p_expire.add_argument("--path", default=None, help="Path to the store dir")
+    p_expire.add_argument(
+        "--before", required=True,
+        help="Cutoff: '90d', '12h', or an ISO date. Older memories are forgotten.",
+    )
+    p_expire.add_argument(
+        "--kind", action="append",
+        choices=["episode", "fact", "preference", "reflection"],
+        help="Only this kind (repeatable). Default: every kind.",
+    )
+    p_expire.set_defaults(func=_cmd_expire)
+
+    p_compact = sub.add_parser(
+        "compact", help="Erase the text of everything already forgotten."
+    )
+    p_compact.add_argument("--path", default=None, help="Path to the store dir")
+    p_compact.set_defaults(func=_cmd_compact)
+
     p_status = sub.add_parser("status", help="Show what's stored and where.")
     p_status.add_argument("--path", default=None, help="Path to store dir")
     p_status.set_defaults(func=_cmd_status)
@@ -413,15 +557,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_reflect.add_argument("--path", default=None, help="Path to the store dir")
     p_reflect.add_argument(
+        "--all", action="store_true",
+        help="Reflect every store listed in $HIPPOCAMP_STORES (for a nightly job).",
+    )
+    p_reflect.add_argument(
         "--since",
         default=None,
         help="ISO timestamp cutoff. Default: meta.last_reflect_at, else now-7d.",
     )
     p_reflect.add_argument(
         "--llm",
-        default="anthropic",
-        help="LLM adapter to use. Currently: 'anthropic' (default). "
-        "Set ANTHROPIC_API_KEY in environment.",
+        default="local",
+        help="LLM adapter: 'local' (default — an OpenAI-compatible server on "
+        "this machine; HIPPOCAMP_LLM_URL / HIPPOCAMP_LLM_MODEL override). "
+        "'anthropic' and 'claude-cli' send memory text to Anthropic and only "
+        "run with HIPPOCAMP_ALLOW_CLOUD_REFLECT=1.",
     )
     p_reflect.set_defaults(func=_cmd_reflect)
 

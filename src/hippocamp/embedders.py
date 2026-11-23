@@ -108,6 +108,11 @@ class Qwen3Embedder:
 
     name = "Qwen3-Embedding-0.6B"
     dim = 1024
+    # Calibrated on evals/ (see evals/tune.py). Query-to-memory similarity
+    # of a correct answer is rarely below this. It is a floor, not a judge:
+    # similarity alone cannot tell "about the same topic" from "answers it".
+    strong_similarity = 0.35
+    similar_statement = 0.60   # statement-to-statement: worth showing as "similar"
 
     def __init__(self, model_id: str = "Qwen/Qwen3-Embedding-0.6B") -> None:
         try:
@@ -117,11 +122,111 @@ class Qwen3Embedder:
                 "Qwen3Embedder requires sentence-transformers. "
                 "Install with: pip install 'hippocamp[embeddings]'"
             ) from e
-        self._model = SentenceTransformer(model_id)
+        # Once the model is on disk, load it without touching the network.
+        # Only a first run (nothing cached) is allowed to download.
+        try:
+            self._model = SentenceTransformer(model_id, local_files_only=True)
+        except Exception:
+            self._model = SentenceTransformer(model_id)
 
     def __call__(self, text: str) -> list[float]:
         vec = self._model.encode(text, normalize_embeddings=True)
         return vec.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a *question*. Qwen3 is trained with an instruction on the
+        query side and none on the stored side; without it, short questions
+        land far from the memories that answer them."""
+        vec = self._model.encode(text, prompt_name="query", normalize_embeddings=True)
+        return vec.tolist()
+
+
+class LocalServerEmbedder:
+    """Embeddings from an OpenAI-compatible server on this machine (LM
+    Studio, llama.cpp server, Ollama's /v1).
+
+    Loopback only: memory text is never sent to another host. `doc_prefix`
+    and `query_prefix` carry the model's task prompts, for models that are
+    trained with them.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        name: str,
+        dim: int,
+        base_url: str | None = None,
+        doc_prefix: str = "",
+        query_prefix: str = "",
+        strong_similarity: float | None = None,
+        similar_statement: float | None = None,
+        timeout: int = 60,
+    ) -> None:
+        import os
+
+        from hippocamp.reflect import DEFAULT_LOCAL_URL, _is_loopback
+
+        url = (base_url or os.environ.get("HIPPOCAMP_EMBED_URL") or DEFAULT_LOCAL_URL).rstrip("/")
+        if not _is_loopback(url):
+            raise RuntimeError(f"embedding server must be on this machine (loopback); got {url!r}")
+        self._url, self._model, self._timeout = url, model, timeout
+        self.name, self.dim = name, dim
+        self._doc_prefix, self._query_prefix = doc_prefix, query_prefix
+        if strong_similarity is not None:
+            self.strong_similarity = strong_similarity
+        if similar_statement is not None:
+            self.similar_statement = similar_statement
+
+    def _embed(self, text: str) -> list[float]:
+        import json
+        import math
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(
+            self._url + "/v1/embeddings",
+            data=json.dumps({"model": self._model, "input": [text]}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                vec = json.loads(resp.read().decode())["data"][0]["embedding"]
+        except (urllib.error.URLError, OSError, ValueError, KeyError, IndexError) as e:
+            raise RuntimeError(
+                f"local embedding server at {self._url} did not answer ({e}); "
+                "start it and load the embedding model"
+            ) from e
+        if len(vec) != self.dim:
+            raise RuntimeError(f"{self._model} returned {len(vec)} dims, expected {self.dim}")
+        norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+        return [x / norm for x in vec]
+
+    def __call__(self, text: str) -> list[float]:
+        return self._embed(self._doc_prefix + text)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(self._query_prefix + text)
+
+
+def embeddinggemma(
+    model: str | None = None, base_url: str | None = None
+) -> LocalServerEmbedder:
+    """Google's EmbeddingGemma-300m served by a local server, with the task
+    prompts it was trained with. `model` is the id the server lists
+    (HIPPOCAMP_EMBED_MODEL, default LM Studio's name for it)."""
+    import os
+
+    return LocalServerEmbedder(
+        model or os.environ.get("HIPPOCAMP_EMBED_MODEL") or "text-embedding-embeddinggemma-300m-qat",
+        name="embeddinggemma-300m",
+        dim=768,
+        base_url=base_url,
+        doc_prefix="title: none | text: ",
+        query_prefix="task: search result | query: ",
+        strong_similarity=0.40,
+        similar_statement=0.60,
+    )
 
 
 def default_embedder() -> Embedder:

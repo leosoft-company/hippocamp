@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import struct
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,7 +59,34 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+
+-- Why a memory is inactive, kept apart from the row so it holds whatever
+-- order events arrive in: a forget that is applied before the memory it
+-- names (clock skew, late sync) still wins when the memory shows up.
+CREATE TABLE IF NOT EXISTS tombstones (
+    mem_id TEXT PRIMARY KEY,
+    at TEXT NOT NULL,
+    reason TEXT NOT NULL            -- 'superseded' | 'forgotten' | 'purged'
+);
+
+CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+
+# Columns added after v0.11. Added in place so existing caches keep working.
+_ADDED_COLUMNS = {
+    "forgotten_at": "TEXT",     # set when the owner asked to forget (not when replaced)
+    "reflected_at": "TEXT",     # episodes: set once consolidation has read them
+    "norm": "TEXT",             # normalised text, for exact-duplicate checks
+}
+
+# sqlite-vec refuses k above this in a KNN query.
+_VEC_MAX_K = 4096
+
+
+def normalise(text: str) -> str:
+    """Canonical form for duplicate checks: case, spacing and trailing
+    punctuation don't make a different memory."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower()).rstrip(".!?;, ")
 
 
 def _serialize_f32(values: list[float]) -> bytes:
@@ -90,11 +119,34 @@ class Store:
     ) -> None:
         self._path = str(path)
         self._embedding_dim = embedding_dim
-        self._conn = sqlite3.connect(self._path, isolation_level=None)
+        if self._path != ":memory:":
+            # Owner-only before SQLite touches it; the -wal/-shm files
+            # inherit the main file's mode.
+            fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.close(fd)
+            for p in (self._path, self._path + "-wal", self._path + "-shm"):
+                if os.path.exists(p):
+                    os.chmod(p, 0o600)
+        self._conn = sqlite3.connect(self._path, isolation_level=None, timeout=30)
         if self._path != ":memory:":
             self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
+        # Deleted rows are overwritten, not just unlinked — purge relies on it.
+        self._conn.execute("PRAGMA secure_delete = ON")
         self._conn.executescript(SCHEMA)
+        have = {r[1] for r in self._conn.execute("PRAGMA table_info(memories)")}
+        for col, decl in _ADDED_COLUMNS.items():
+            if col not in have:
+                self._conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {decl}")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_norm ON memories(kind, norm)"
+        )
+        for mem_id, text in self._conn.execute(
+            "SELECT id, text FROM memories WHERE norm IS NULL"
+        ).fetchall():
+            self._conn.execute(
+                "UPDATE memories SET norm = ? WHERE id = ?", (normalise(text), mem_id)
+            )
         self._vec_enabled = self._try_enable_vec()
         if self._vec_enabled:
             self._maybe_backfill_vec()
@@ -157,6 +209,15 @@ class Store:
         if vec_count >= active_count:
             return  # nothing to do (or vec is fully populated)
 
+        self._conn.execute("BEGIN IMMEDIATE")  # not while another process is mid-insert
+        try:
+            self._backfill_vec(active_count)
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def _backfill_vec(self, active_count: int) -> None:
         rows = self._conn.execute(
             "SELECT rowid, embedding FROM memories WHERE superseded_at IS NULL"
         ).fetchall()
@@ -209,11 +270,31 @@ class Store:
         embedding: list[float],
         extras: dict | None = None,
     ) -> None:
+        # A tombstone may already be waiting for this id (events can arrive
+        # out of order). Purged: never store it. Otherwise it is born inactive.
+        tomb = self._conn.execute(
+            "SELECT at, reason FROM tombstones WHERE mem_id = ?", (id,)
+        ).fetchone()
+        if tomb and tomb[1] == "purged":
+            return
+        # Row and vector go in together: another process opening this cache
+        # mid-write must never see a row without its vector (its backfill
+        # would add one and ours would then collide).
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._insert(id, kind, text, created_at, metadata, embedding, extras, tomb)
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def _insert(self, id, kind, text, created_at, metadata, embedding, extras, tomb) -> None:
         cur = self._conn.execute(
             """
-            INSERT INTO memories (id, kind, text, created_at, last_seen_at,
-                                  metadata, embedding, extras)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO memories (id, kind, text, created_at, last_seen_at,
+                                  metadata, embedding, extras, norm,
+                                  superseded_at, forgotten_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 id,
@@ -224,8 +305,13 @@ class Store:
                 json.dumps(metadata),
                 json.dumps(embedding),
                 json.dumps(extras or {}),
+                normalise(text),
+                tomb[0] if tomb else None,
+                tomb[0] if tomb and tomb[1] == "forgotten" else None,
             ),
         )
+        if cur.rowcount == 0:
+            return  # already present (the same event applied twice)
         if self._vec_enabled and self._embedding_dim is not None:
             if len(embedding) != self._embedding_dim:
                 log.warning(
@@ -237,6 +323,7 @@ class Store:
                     },
                 )
             else:
+                self._conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (cur.lastrowid,))
                 self._conn.execute(
                     "INSERT INTO memories_vec(rowid, embedding) VALUES (?, ?)",
                     (cur.lastrowid, _serialize_f32([float(x) for x in embedding])),
@@ -292,7 +379,11 @@ class Store:
         ts = (when or datetime.now(timezone.utc)).isoformat()
         for old_id in ids:
             self._conn.execute(
-                "UPDATE memories SET superseded_at = ? WHERE id = ?",
+                "INSERT OR IGNORE INTO tombstones(mem_id, at, reason) VALUES (?, ?, 'superseded')",
+                (old_id, ts),
+            )
+            self._conn.execute(
+                "UPDATE memories SET superseded_at = ? WHERE id = ? AND superseded_at IS NULL",
                 (ts, old_id),
             )
 
@@ -304,6 +395,7 @@ class Store:
         query_emb: list[float],
         kinds: list[str] | None,
         candidate_limit: int,
+        query_tokens: set[str] | None = None,
     ) -> list[RawRow]:
         """Return candidate rows for the ranker.
 
@@ -318,8 +410,43 @@ class Store:
         if self._vec_enabled and self._embedding_dim is not None and len(
             query_emb
         ) == self._embedding_dim:
-            return self._search_vec(query_emb, kinds, candidate_limit)
+            rows = self._search_vec(query_emb, kinds, candidate_limit)
+            # Hybrid retrieval: a row containing the query's distinctive
+            # tokens must reach the ranker even when the embedder puts it
+            # outside the KNN neighbourhood (small embedders rank generic
+            # attractor memories above literal topic matches).
+            if query_tokens:
+                seen = {row.id for row in rows}
+                rows += [
+                    row for row in self._search_lexical(query_tokens, kinds)
+                    if row.id not in seen
+                ]
+            return rows
         return self._search_naive(kinds)
+
+    def _search_lexical(
+        self, tokens: set[str], kinds: list[str] | None, limit: int = 200
+    ) -> list[RawRow]:
+        if not tokens:
+            return []
+        sql = (
+            "SELECT id, kind, text, created_at, last_seen_at, salience, "
+            "metadata, embedding FROM memories WHERE superseded_at IS NULL"
+        )
+        params: list[Any] = []
+        likes = []
+        for token in sorted(tokens)[:8]:  # cap the OR fan-out
+            likes.append("lower(text) LIKE ?")
+            params.append(f"%{token}%")
+        sql += " AND (" + " OR ".join(likes) + ")"
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            sql += f" AND kind IN ({placeholders})"
+            params.extend(kinds)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_from_tuple(r) for r in rows]
 
     def _search_vec(
         self,
@@ -328,7 +455,26 @@ class Store:
         candidate_limit: int,
     ) -> list[RawRow]:
         # KNN over the vec table, then join with memories for row data
-        # and to apply the active + kind filters in SQL.
+        # and to apply the active + kind filters in SQL. The filters run
+        # AFTER the nearest-k cut, so a rare kind (or a store with many
+        # inactive rows) can come back short: widen k until we have enough,
+        # and past sqlite-vec's cap fall back to scanning the kind itself.
+        total = self._conn.execute("SELECT COUNT(*) FROM memories_vec").fetchone()[0]
+        k = max(1, int(candidate_limit))
+        while True:
+            rows = self._knn(query_emb, kinds, min(k, _VEC_MAX_K))
+            if len(rows) >= candidate_limit or k >= total:
+                return rows
+            if k >= _VEC_MAX_K:
+                return self._search_naive(kinds) if kinds else rows
+            k *= 4
+
+    def _knn(
+        self,
+        query_emb: list[float],
+        kinds: list[str] | None,
+        candidate_limit: int,
+    ) -> list[RawRow]:
         sql = (
             "SELECT m.id, m.kind, m.text, m.created_at, m.last_seen_at, "
             "m.salience, m.metadata, m.embedding "
@@ -377,16 +523,110 @@ class Store:
 
     # ------------------------------------------------------ misc maintenance
 
-    def bump_salience(self, ids: list[str]) -> None:
-        if not ids:
+    def state(self, id: str) -> str | None:
+        """'active', 'inactive', or None if this cache has never seen the id."""
+        r = self._conn.execute(
+            "SELECT superseded_at FROM memories WHERE id = ?", (id,)
+        ).fetchone()
+        if r is None:
+            return None
+        return "active" if r[0] is None else "inactive"
+
+    def kind_of(self, id: str) -> str | None:
+        r = self._conn.execute("SELECT kind FROM memories WHERE id = ?", (id,)).fetchone()
+        return r[0] if r else None
+
+    def find_duplicate(self, kind: str, text: str) -> str | None:
+        """Id of an active memory of this kind with the same normalised text."""
+        r = self._conn.execute(
+            "SELECT id FROM memories WHERE kind = ? AND norm = ? "
+            "AND superseded_at IS NULL ORDER BY created_at LIMIT 1",
+            (kind, normalise(text)),
+        ).fetchone()
+        return r[0] if r else None
+
+    def forgotten_ids(self) -> list[str]:
+        return [r[0] for r in self._conn.execute(
+            "SELECT mem_id FROM tombstones WHERE reason = 'forgotten'"
+        )]
+
+    def purge(self, id: str, *, when: datetime | None = None) -> None:
+        """Remove a memory's row and vector for good and remember that it
+        was purged, so a replayed or late event cannot bring it back."""
+        ts = (when or datetime.now(timezone.utc)).isoformat()
+        self._conn.execute(
+            "INSERT INTO tombstones(mem_id, at, reason) VALUES (?, ?, 'purged') "
+            "ON CONFLICT(mem_id) DO UPDATE SET reason = 'purged'",
+            (id, ts),
+        )
+        row = self._conn.execute("SELECT rowid FROM memories WHERE id = ?", (id,)).fetchone()
+        if row is None:
             return
-        now = datetime.now(timezone.utc).isoformat()
+        if self._vec_enabled:
+            self._conn.execute("DELETE FROM memories_vec WHERE rowid = ?", (row[0],))
+        self._conn.execute("DELETE FROM memories WHERE id = ?", (id,))
+
+    def scrub(self) -> None:
+        """Make sure purged text is gone from the file, not just the tables."""
+        if self._path != ":memory:":
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def mark_reflected(self, ids: list[str], *, when: datetime | None = None) -> None:
+        ts = (when or datetime.now(timezone.utc)).isoformat()
         for mem_id in ids:
             self._conn.execute(
-                "UPDATE memories SET salience = salience + 1.0, "
-                "last_seen_at = ? WHERE id = ?",
-                (now, mem_id),
+                "UPDATE memories SET reflected_at = ? WHERE id = ? AND reflected_at IS NULL",
+                (ts, mem_id),
             )
+
+    def episodes_pending(self, *, limit: int, before: datetime | None = None) -> list[RawRow]:
+        """Active episodes consolidation has not read yet, oldest first."""
+        sql = (
+            "SELECT id, kind, text, created_at, last_seen_at, salience, "
+            "metadata, embedding FROM memories "
+            "WHERE kind = 'episode' AND superseded_at IS NULL AND reflected_at IS NULL"
+        )
+        params: list[Any] = []
+        if before is not None:
+            sql += " AND created_at < ?"
+            params.append(before.isoformat())
+        sql += " ORDER BY created_at ASC LIMIT ?"
+        params.append(limit)
+        return [self._row_from_tuple(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def kv_get(self, key: str) -> str | None:
+        r = self._conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return r[0] if r else None
+
+    def kv_set(self, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO kv(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+    def kv_max(self, key: str, n: int) -> None:
+        """Raise an integer value to at least `n` (atomic)."""
+        self._conn.execute(
+            "INSERT INTO kv(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), ?)",
+            (key, str(n), n),
+        )
+
+    def applied(self) -> dict[str, int] | None:
+        """Lines of each device file already applied to this cache, or None
+        if the cache has never recorded that (new, or written by v0.11)."""
+        if self.kv_get("applied_init") is None:
+            return None
+        return {
+            r[0][len("applied:"):]: int(r[1])
+            for r in self._conn.execute("SELECT key, value FROM kv WHERE key LIKE 'applied:%'")
+        }
+
+    def set_applied(self, counts: dict[str, int]) -> None:
+        self.kv_set("applied_init", "1")
+        for name, n in counts.items():
+            self.kv_max("applied:" + name, n)
 
     def tombstone(self, id: str, *, when: datetime | None = None) -> None:
         """Mark a memory inactive (soft-delete). Preserves the row so the
@@ -399,13 +639,22 @@ class Store:
         """
         ts = (when or datetime.now(timezone.utc)).isoformat()
         self._conn.execute(
-            "UPDATE memories SET superseded_at = ? WHERE id = ?",
-            (ts, id),
+            "INSERT INTO tombstones(mem_id, at, reason) VALUES (?, ?, 'forgotten') "
+            "ON CONFLICT(mem_id) DO UPDATE SET reason = 'forgotten' "
+            "WHERE tombstones.reason = 'superseded'",
+            (id, ts),
+        )
+        self._conn.execute(
+            "UPDATE memories SET superseded_at = COALESCE(superseded_at, ?), "
+            "forgotten_at = COALESCE(forgotten_at, ?) WHERE id = ?",
+            (ts, ts, id),
         )
 
     def wipe(self) -> None:
         """Drop all rows. Used by `Memory.replay()` before rebuilding."""
         self._conn.execute("DELETE FROM memories")
+        self._conn.execute("DELETE FROM tombstones")
+        self._conn.execute("DELETE FROM kv")
         if self._vec_enabled:
             self._conn.execute("DELETE FROM memories_vec")
 
@@ -425,14 +674,16 @@ class Store:
         ).fetchall()
         return [self._row_from_tuple(r) for r in rows]
 
-    def list_active_before(self, cutoff: datetime) -> list[str]:
+    def list_active_before(
+        self, cutoff: datetime, kinds: list[str] | None = None
+    ) -> list[str]:
         """Ids of active (non-superseded) memories created before `cutoff`."""
-        rows = self._conn.execute(
-            "SELECT id FROM memories "
-            "WHERE created_at < ? AND superseded_at IS NULL",
-            (cutoff.isoformat(),),
-        ).fetchall()
-        return [r[0] for r in rows]
+        sql = "SELECT id FROM memories WHERE created_at < ? AND superseded_at IS NULL"
+        params: list[Any] = [cutoff.isoformat()]
+        if kinds:
+            sql += f" AND kind IN ({','.join('?' * len(kinds))})"
+            params.extend(kinds)
+        return [r[0] for r in self._conn.execute(sql, params).fetchall()]
 
     def expire_before(self, cutoff: datetime) -> int:
         """Tombstone all active memories created before `cutoff`. Returns count."""

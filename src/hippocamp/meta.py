@@ -11,6 +11,7 @@ stable id used in every event it writes.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,9 @@ class StoreMeta(BaseModel):
     schema_version: int = SCHEMA_VERSION
     created_at: datetime
     last_reflect_at: datetime | None = None
+    # True once consolidation tracks the episodes it has read (a
+    # `mark_reflected` event) rather than relying on last_reflect_at alone.
+    reflect_tracking: bool = False
 
 
 def _new_id() -> str:
@@ -57,6 +61,7 @@ def load_or_init_meta(
                 f"Run `hippocamp reindex --embedder {embedder_name}` to migrate, "
                 f"or open with the matching embedder."
             )
+        os.chmod(meta_path, 0o600)
         return meta
 
     meta = StoreMeta(
@@ -66,6 +71,7 @@ def load_or_init_meta(
     )
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(meta.model_dump_json(indent=2) + "\n")
+    os.chmod(meta_path, 0o600)
     return meta
 
 
@@ -74,6 +80,7 @@ def write_meta(meta_path: Path, meta: StoreMeta) -> None:
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
     tmp.write_text(meta.model_dump_json(indent=2) + "\n")
+    os.chmod(tmp, 0o600)
     tmp.replace(meta_path)
 
 

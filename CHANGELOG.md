@@ -2,6 +2,49 @@
 
 All notable changes to Hippocamp are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html) (within the 0.x line, expect occasional breaking changes between minor versions).
 
+## Unreleased
+
+Fitness work for household use — see docs/fitness-plan.md. Existing stores open unchanged; caches are upgraded in place without re-embedding.
+
+### Recall
+- Qwen3 queries now use the model's query instruction (no reindex needed).
+- Facts, preferences and reflections no longer fade with age; only episodes do, slightly.
+- Durable memories and episodes are fetched separately, and the kind filter widens the search until the list is full.
+- Recall no longer writes to the store (the usage/salience bump is gone), so repeated questions give identical answers.
+- Every result has `match: "strong" | "weak"`; the tools add a note when nothing is strong.
+- Unknown kinds raise; `limit <= 0` returns nothing; near-identical episodes no longer fill the top places.
+
+### Writing and corrections
+- Saving the same fact/preference/reflection again returns the existing id.
+- `supersedes` works for preferences as well as facts, and is exposed on the `update_memory` tool.
+- `update_memory` reports `similar` existing memories and `duplicate`.
+- Empty text, unknown ids (forget / supersede) are errors. Preference strength is clamped to 0–1 and nudges ranking.
+
+### Reflect
+- Tracks which episodes it has read (`mark_reflected` events) instead of a clock cutoff; processes everything pending in batches.
+- The model sees the nearest existing memories with ids and names what an item `replaces`. The 0.85-similarity auto-replace is gone.
+- Local adapter: 16,000 output tokens; a reply cut off by the limit splits the batch and retries.
+- A lock left by a dead process is taken over. Episodes are shown up to 1,500 characters.
+
+### Forgetting and privacy
+- `Memory.purge(id)` and `compact()` erase text from the event log and the cache; `hippocamp forget [--purge]`, `expire`, `compact`.
+- Forgets and replacements hold whatever order events arrive in (clock skew, late sync).
+- Store and cache files are owner-only (0700 / 0600).
+- A cached Qwen3 model loads without contacting the network.
+
+### Robustness
+- Unreadable event-log lines are skipped with a warning instead of making the store unopenable.
+- Opening a store applies events other devices added since last time.
+
+### Optional components
+- Reranker: `HIPPOCAMP_RERANKER=qwen3` (or `Memory(reranker=...)`) re-scores the best candidates; better first-place ranking and a real "nothing stored answers this" signal. `Why.rerank` carries the score.
+- `LocalServerEmbedder` / `embeddinggemma()`: embeddings from a loopback OpenAI-compatible server; `reindex --embedder embeddinggemma`.
+- Local reflect adapter asks for schema-constrained JSON with thinking off (seconds instead of minutes per batch); prompt tightened so routine episodes yield nothing.
+- `hippocamp reflect --all` reflects every store in `$HIPPOCAMP_STORES`.
+
+### Compatibility
+- New event ops `mark_reflected` and `purge`: a device still on 0.11 cannot read a log that contains them. Upgrade every device that shares a store.
+
 ## [Unreleased]
 
 ## [0.11.1] — 2026-05
